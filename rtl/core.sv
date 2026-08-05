@@ -74,8 +74,10 @@ module spin_core (
     logic [31:0] lfsr_state;
     logic [31:0] noise_seed_reg;
 
-    logic [WEIGHT_W*SPIN_COUNT-1:0] weight_mem [0:SPIN_COUNT-1];
     logic [WEIGHT_BEAT_W:0] weight_beat_count;
+    logic [WEIGHT_BEAT_W-1:0] local_weight_read_row;
+    logic [WEIGHT_W*SPIN_COUNT-1:0] local_weight_read_data;
+    logic local_weight_write_enable;
 
     logic [PARTIAL_BEAT_W-1:0] h0_partial_beat_count;
     logic [PARTIAL_BEAT_W-1:0] ext_partial_beat_count;
@@ -89,6 +91,7 @@ module spin_core (
     assign h0_partial_ready = core_state == CORE_ACCUMULATE;
     assign ext_partial_ready = core_state == CORE_ACCUMULATE;
     assign iter_done = (core_state == CORE_WAIT_COMMIT);
+    assign local_weight_write_enable = weight_init_valid && weight_init_ready;
     always_comb begin
         for (int i = 0; i < SPIN_COUNT; i++) begin
             state_next[i] = ~accumulator_total[i][ACC_W-1];
@@ -100,12 +103,28 @@ module spin_core (
                lfsr_state[1]  ^
                lfsr_state[0];
 
+    // The core's diagonal 32x32 block is resident in SRAM slot zero.
+    j_block_sram #(
+        .ROW_COUNT(SPIN_COUNT),
+        .ROW_W(SPIN_COUNT*WEIGHT_W)
+    ) local_weight_sram (
+        .clk,
+        .write_enable_i(local_weight_write_enable),
+        .write_slot_i(1'b0),
+        .write_row_i(weight_beat_count[WEIGHT_BEAT_W-1:0]),
+        .write_data_i(weight_init_data),
+        .read_slot_i(1'b0),
+        .read_row_i(local_weight_read_row),
+        .read_data_o(local_weight_read_data)
+    );
+
     //MVM Engine
     mvm mvm_local(
         .clk,
         .rst, 
         .start(iter_start&&core_state==CORE_IDLE), 
-        .weight_mem, 
+        .weight_row_o(local_weight_read_row),
+        .weight_data_i(local_weight_read_data),
         .result(accumulator_local),
         .state(state_current),
         .done(local_compute_done)
@@ -130,7 +149,6 @@ module spin_core (
             accumulator_ext <= '{default: '0};
             done_latched<=1'b0;
             lfsr_state  <= '{default: '0};
-            weight_mem  <= '{default: '0};
         end
         else begin
             done_latched<=done?1:done_latched;
@@ -151,7 +169,6 @@ module spin_core (
             end
             if(core_state==CORE_INIT) begin
                 if(weight_init_valid&&weight_init_ready)begin
-                    weight_mem[weight_beat_count]<=weight_init_data;
                     weight_beat_count<=weight_beat_count+1;
                 end
             end
