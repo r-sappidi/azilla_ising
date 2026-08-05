@@ -9,6 +9,7 @@ all: run
 
 $(BUILD_DIR)/V$(TOP): \
 	$(RTL_DIR)/ising_pkg.sv \
+	$(RTL_DIR)/j_block_sram.sv \
 	$(RTL_DIR)/mvm.sv \
 	$(RTL_DIR)/core.sv \
 	spin_core_tb.sv
@@ -17,6 +18,7 @@ $(BUILD_DIR)/V$(TOP): \
 		--top-module $(TOP) \
 		--Mdir $(BUILD_DIR) \
 		$(RTL_DIR)/ising_pkg.sv \
+		$(RTL_DIR)/j_block_sram.sv \
 		$(RTL_DIR)/mvm.sv \
 		$(RTL_DIR)/core.sv \
 		spin_core_tb.sv
