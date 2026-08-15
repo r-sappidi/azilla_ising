@@ -82,17 +82,23 @@ module hierarchy_node #(
         NODE_DONE
     } node_state_t;
 
-    typedef enum logic [2:0] {
+    typedef enum logic [1:0] {
         ENGINE_IDLE,
         ENGINE_START,
-        ENGINE_COMPUTE,
-        ENGINE_SEND_A,
-        ENGINE_SEND_B
+        ENGINE_COMPUTE
     } engine_state_t;
+
+    typedef enum logic [1:0] {
+        OUTPUT_IDLE,
+        OUTPUT_SEND_A,
+        OUTPUT_SEND_B
+    } output_state_t;
 
     node_state_t node_state, node_state_n;
     engine_state_t engine_state [0:MVM_COUNT-1];
     engine_state_t engine_state_n [0:MVM_COUNT-1];
+    output_state_t output_state [0:MVM_COUNT-1];
+    output_state_t output_state_n [0:MVM_COUNT-1];
 
     logic schedule_done_pending;
     logic [MVM_COUNT-1:0] engine_work_done;
@@ -133,6 +139,23 @@ module hierarchy_node #(
         engine_result_a [0:MVM_COUNT-1][0:SPIN_COUNT-1];
     logic signed [ACC_W-1:0]
         engine_result_b [0:MVM_COUNT-1][0:SPIN_COUNT-1];
+
+    // Two result slots decouple the 32-cycle MVM pipeline from result
+    // serialization. A compute reserves a free slot before it starts, then
+    // deposits both directional vectors and their destination metadata when
+    // it completes. The output controller drains a different slot in parallel.
+    logic [1:0] engine_result_slot_valid [0:MVM_COUNT-1];
+    logic [1:0] engine_result_slot_reserved [0:MVM_COUNT-1];
+    logic engine_result_write_slot [0:MVM_COUNT-1];
+    logic engine_result_read_slot [0:MVM_COUNT-1];
+    logic signed [ACC_W-1:0]
+        engine_result_buffer_a [0:MVM_COUNT-1][0:1][0:SPIN_COUNT-1];
+    logic signed [ACC_W-1:0]
+        engine_result_buffer_b [0:MVM_COUNT-1][0:1][0:SPIN_COUNT-1];
+    logic [GLOBAL_BLOCK_ID_W-1:0]
+        engine_result_block_a [0:MVM_COUNT-1][0:1];
+    logic [GLOBAL_BLOCK_ID_W-1:0]
+        engine_result_block_b [0:MVM_COUNT-1][0:1];
 
     // Result serializer and reduction-fabric request signals.
     logic [PARTIAL_BEAT_W-1:0] engine_partial_beat [0:MVM_COUNT-1];
@@ -201,25 +224,29 @@ module hierarchy_node #(
         engine_partial_data = '0;
 
         for (int engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin
-            if (engine_state[engine_index] == ENGINE_SEND_A) begin
+            if (output_state[engine_index] == OUTPUT_SEND_A) begin
                 engine_partial_valid[engine_index] = 1'b1;
                 engine_partial_block[engine_index] =
-                    engine_slot_block_a[engine_index][engine_active_slot[engine_index]];
+                    engine_result_block_a[engine_index]
+                        [engine_result_read_slot[engine_index]];
 
                 for (int lane = 0; lane < PARTIAL_LANES; lane++) begin
                     engine_partial_data[engine_index][lane*ACC_W +: ACC_W] =
-                        engine_result_a[engine_index]
+                        engine_result_buffer_a[engine_index]
+                            [engine_result_read_slot[engine_index]]
                             [engine_partial_beat[engine_index]*PARTIAL_LANES + lane];
                 end
             end
-            else if (engine_state[engine_index] == ENGINE_SEND_B) begin
+            else if (output_state[engine_index] == OUTPUT_SEND_B) begin
                 engine_partial_valid[engine_index] = 1'b1;
                 engine_partial_block[engine_index] =
-                    engine_slot_block_b[engine_index][engine_active_slot[engine_index]];
+                    engine_result_block_b[engine_index]
+                        [engine_result_read_slot[engine_index]];
 
                 for (int lane = 0; lane < PARTIAL_LANES; lane++) begin
                     engine_partial_data[engine_index][lane*ACC_W +: ACC_W] =
-                        engine_result_b[engine_index]
+                        engine_result_buffer_b[engine_index]
+                            [engine_result_read_slot[engine_index]]
                             [engine_partial_beat[engine_index]*PARTIAL_LANES + lane];
                 end
             end
@@ -269,14 +296,17 @@ module hierarchy_node #(
         end
     end
 
-    // An engine's work is done only when it is idle, has no block still loading,
-    // and has no completed J block waiting in either buffer slot.
+    // An engine's work is done only when compute, weight loading, and result
+    // serialization have all drained.
     always_comb begin
         for (int engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin
             engine_work_done[engine_index] =
                 engine_state[engine_index] == ENGINE_IDLE &&
                 engine_slot_valid[engine_index] == 2'b00 &&
-                !engine_load_active[engine_index];
+                !engine_load_active[engine_index] &&
+                output_state[engine_index] == OUTPUT_IDLE &&
+                engine_result_slot_valid[engine_index] == 2'b00 &&
+                engine_result_slot_reserved[engine_index] == 2'b00;
         end
     end
 
@@ -284,16 +314,19 @@ module hierarchy_node #(
     assign node_work_done = schedule_done_pending && all_engine_work_done;
 
     // ---------------------------------------------------------------------
-    // Per-engine state machines
+    // Per-engine compute and output state machines
     // ---------------------------------------------------------------------
     always_comb begin
         for (int engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin
             engine_state_n[engine_index] = engine_state[engine_index];
+            output_state_n[engine_index] = output_state[engine_index];
             engine_start[engine_index] = 1'b0;
 
             unique case (engine_state[engine_index])
                 ENGINE_IDLE: begin
-                    if (engine_slot_valid[engine_index] != 2'b00)
+                    if (engine_slot_valid[engine_index] != 2'b00 &&
+                        (engine_result_slot_valid[engine_index] |
+                         engine_result_slot_reserved[engine_index]) != 2'b11)
                         engine_state_n[engine_index] = ENGINE_START;
                 end
                 ENGINE_START: begin
@@ -302,19 +335,29 @@ module hierarchy_node #(
                 end
                 ENGINE_COMPUTE: begin
                     if (engine_done[engine_index])
-                        engine_state_n[engine_index] = ENGINE_SEND_A;
-                end
-                ENGINE_SEND_A: begin
-                    if (engine_partial_accepted[engine_index] &&
-                        engine_partial_beat[engine_index] == PARTIAL_BEAT_W'(PARTIAL_BEATS-1))
-                        engine_state_n[engine_index] = ENGINE_SEND_B;
-                end
-                ENGINE_SEND_B: begin
-                    if (engine_partial_accepted[engine_index] &&
-                        engine_partial_beat[engine_index] == PARTIAL_BEAT_W'(PARTIAL_BEATS-1))
                         engine_state_n[engine_index] = ENGINE_IDLE;
                 end
                 default: engine_state_n[engine_index] = ENGINE_IDLE;
+            endcase
+
+            unique case (output_state[engine_index])
+                OUTPUT_IDLE: begin
+                    if (engine_result_slot_valid[engine_index] != 2'b00)
+                        output_state_n[engine_index] = OUTPUT_SEND_A;
+                end
+                OUTPUT_SEND_A: begin
+                    if (engine_partial_accepted[engine_index] &&
+                        engine_partial_beat[engine_index] ==
+                            PARTIAL_BEAT_W'(PARTIAL_BEATS-1))
+                        output_state_n[engine_index] = OUTPUT_SEND_B;
+                end
+                OUTPUT_SEND_B: begin
+                    if (engine_partial_accepted[engine_index] &&
+                        engine_partial_beat[engine_index] ==
+                            PARTIAL_BEAT_W'(PARTIAL_BEATS-1))
+                        output_state_n[engine_index] = OUTPUT_IDLE;
+                end
+                default: output_state_n[engine_index] = OUTPUT_IDLE;
             endcase
         end
     end
@@ -346,19 +389,27 @@ module hierarchy_node #(
             always_ff @(posedge clk) begin
                 if (rst) begin
                     engine_state[engine_index] <= ENGINE_IDLE;
+                    output_state[engine_index] <= OUTPUT_IDLE;
                     engine_slot_valid[engine_index] <= 2'b00;
                     engine_load_active[engine_index] <= 1'b0;
                     engine_load_slot[engine_index] <= 1'b0;
                     engine_weight_beat[engine_index] <= '0;
                     engine_active_slot[engine_index] <= 1'b0;
+                    engine_result_slot_valid[engine_index] <= 2'b00;
+                    engine_result_slot_reserved[engine_index] <= 2'b00;
+                    engine_result_write_slot[engine_index] <= 1'b0;
+                    engine_result_read_slot[engine_index] <= 1'b0;
                     engine_partial_beat[engine_index] <= '0;
                     engine_slot_state_a_index[engine_index] <= '{default: '0};
                     engine_slot_state_b_index[engine_index] <= '{default: '0};
                     engine_slot_block_a[engine_index] <= '{default: '0};
                     engine_slot_block_b[engine_index] <= '{default: '0};
+                    engine_result_block_a[engine_index] <= '{default: '0};
+                    engine_result_block_b[engine_index] <= '{default: '0};
                 end
                 else begin
                     engine_state[engine_index] <= engine_state_n[engine_index];
+                    output_state[engine_index] <= output_state_n[engine_index];
 
                     // Reserve a free J-buffer slot and remember its two core
                     // destinations before accepting any weight beats.
@@ -404,16 +455,66 @@ module hierarchy_node #(
                     // pulse on the following cycle.
                     if (engine_state[engine_index] == ENGINE_IDLE &&
                         engine_state_n[engine_index] == ENGINE_START) begin
+                        logic selected_j_slot;
+                        logic selected_result_slot;
+
+                        selected_j_slot = !engine_slot_valid[engine_index][0];
+                        selected_result_slot =
+                            engine_result_slot_valid[engine_index][0] ||
+                            engine_result_slot_reserved[engine_index][0];
+
                         if (engine_slot_valid[engine_index][0])
                             engine_active_slot[engine_index] <= 1'b0;
                         else
                             engine_active_slot[engine_index] <= 1'b1;
+
+                        engine_result_write_slot[engine_index] <=
+                            selected_result_slot;
+                        engine_result_slot_reserved[engine_index]
+                            [selected_result_slot] <= 1'b1;
+                        engine_result_block_a[engine_index]
+                            [selected_result_slot] <=
+                                engine_slot_block_a[engine_index][selected_j_slot];
+                        engine_result_block_b[engine_index]
+                            [selected_result_slot] <=
+                                engine_slot_block_b[engine_index][selected_j_slot];
+                    end
+
+                    // Copy completed arithmetic into its reserved result slot.
+                    // The J slot is no longer needed and can immediately be
+                    // refilled while this result is serialized independently.
+                    if (engine_state[engine_index] == ENGINE_COMPUTE &&
+                        engine_done[engine_index]) begin
+                        for (int spin_index = 0;
+                             spin_index < SPIN_COUNT; spin_index++) begin
+                            engine_result_buffer_a[engine_index]
+                                [engine_result_write_slot[engine_index]]
+                                [spin_index] <= engine_result_a[engine_index][spin_index];
+                            engine_result_buffer_b[engine_index]
+                                [engine_result_write_slot[engine_index]]
+                                [spin_index] <= engine_result_b[engine_index][spin_index];
+                        end
+                        engine_result_slot_reserved[engine_index]
+                            [engine_result_write_slot[engine_index]] <= 1'b0;
+                        engine_result_slot_valid[engine_index]
+                            [engine_result_write_slot[engine_index]] <= 1'b1;
+                        engine_slot_valid[engine_index]
+                            [engine_active_slot[engine_index]] <= 1'b0;
+                    end
+
+                    // Select a completed result slot before serialization.
+                    if (output_state[engine_index] == OUTPUT_IDLE &&
+                        output_state_n[engine_index] == OUTPUT_SEND_A) begin
+                        if (engine_result_slot_valid[engine_index][0])
+                            engine_result_read_slot[engine_index] <= 1'b0;
+                        else
+                            engine_result_read_slot[engine_index] <= 1'b1;
                     end
 
                     // Advance the four-beat result serializer only on an
                     // accepted ready/valid transfer.
-                    if (engine_state[engine_index] == ENGINE_SEND_A ||
-                        engine_state[engine_index] == ENGINE_SEND_B) begin
+                    if (output_state[engine_index] == OUTPUT_SEND_A ||
+                        output_state[engine_index] == OUTPUT_SEND_B) begin
                         if (engine_partial_accepted[engine_index]) begin
                             if (engine_partial_beat[engine_index] == PARTIAL_BEAT_W'(PARTIAL_BEATS-1))
                                 engine_partial_beat[engine_index] <= '0;
@@ -426,12 +527,13 @@ module hierarchy_node #(
                         engine_partial_beat[engine_index] <= '0;
                     end
 
-                    // Both directional results have now been accepted, so the
-                    // active block-buffer slot can be reused by the DMA.
-                    if (engine_state[engine_index] == ENGINE_SEND_B &&
+                    // Both directional packets have now been accepted, so this
+                    // result-buffer slot can be reused by a future computation.
+                    if (output_state[engine_index] == OUTPUT_SEND_B &&
                         engine_partial_accepted[engine_index] &&
                         engine_partial_beat[engine_index] == PARTIAL_BEAT_W'(PARTIAL_BEATS-1)) begin
-                        engine_slot_valid[engine_index][engine_active_slot[engine_index]] <= 1'b0;
+                        engine_result_slot_valid[engine_index]
+                            [engine_result_read_slot[engine_index]] <= 1'b0;
                     end
                 end
             end

@@ -2,7 +2,7 @@
 
 import ising_pkg::*;
 
-module h0_star_adapter_tb;
+module h0_adapter_tb;
     localparam int CORE_COUNT = 2;
     localparam int MVM_COUNT = 2;
     localparam int GLOBAL_BLOCK_ID_W = 8;
@@ -23,7 +23,7 @@ module h0_star_adapter_tb;
     int errors;
     logic collision_phase;
 
-    h0_star_adapter #(
+    h0_adapter #(
         .CORE_COUNT(CORE_COUNT),
         .MVM_COUNT(MVM_COUNT),
         .GLOBAL_BLOCK_ID_W(GLOBAL_BLOCK_ID_W),
@@ -118,14 +118,14 @@ module h0_star_adapter_tb;
         partial_valid = '0;
 
         if (errors == 0)
-            $display("PASS: H0 star adapter preserved packets and parallel destinations");
+            $display("PASS: H0 adapter preserved packets and parallel destinations");
         else
-            $fatal(1, "FAIL: H0 star adapter produced %0d errors", errors);
+            $fatal(1, "FAIL: H0 adapter produced %0d errors", errors);
         $finish;
     end
 
     initial begin
         #10000;
-        $fatal(1, "FAIL: H0 star adapter timeout");
+        $fatal(1, "FAIL: H0 adapter timeout");
     end
 endmodule

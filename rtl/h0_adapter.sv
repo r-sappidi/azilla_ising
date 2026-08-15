@@ -1,12 +1,12 @@
 import ising_pkg::*;
 
-// H0-local star adapter.
+// H0-local adapter.
 //
 // Routes the independent partial stream from each hierarchy-node MVM engine
 // to one of the H0 tile's spin cores. Each core is an independent output bank,
 // so transfers to different cores proceed concurrently. A fixed-priority
 // arbiter resolves collisions at each core and locks for the complete packet.
-module h0_star_adapter #(
+module h0_adapter #(
     parameter int CORE_COUNT        = 32,
     parameter int MVM_COUNT         = 16,
     parameter int GLOBAL_BLOCK_ID_W = 16,

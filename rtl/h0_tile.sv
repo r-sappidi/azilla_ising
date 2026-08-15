@@ -1,7 +1,7 @@
 import ising_pkg::*;
 
 // Complete H0 tile: 32 spin cores, one generic hierarchy compute node, and an
-// H0-local star adapter. Higher-level partials enter through a separate stream
+// H0-local adapter. Higher-level partials enter through a separate stream
 // and are delivered directly to the addressed core's external accumulator.
 module h0_tile #(
     parameter int CORE_COUNT        = 32,
@@ -160,12 +160,12 @@ module h0_tile #(
         .partial_last_o(node_partial_last)
     );
 
-    h0_star_adapter #(
+    h0_adapter #(
         .CORE_COUNT(CORE_COUNT),
         .MVM_COUNT(MVM_COUNT),
         .GLOBAL_BLOCK_ID_W(GLOBAL_BLOCK_ID_W),
         .BASE_BLOCK_ID(BASE_BLOCK_ID)
-    ) local_star (
+    ) local_adapter (
         .clk,
         .rst,
         .partial_valid_i(node_partial_valid),
