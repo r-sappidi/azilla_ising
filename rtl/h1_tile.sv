@@ -4,6 +4,10 @@ import ising_pkg::*;
 // range-aware child adapter. The H0 tiles evaluate core-local and intra-H0
 // interactions while the H1 node evaluates interactions crossing child H0s.
 // Parent-level partials are merged into the same H0 external-partial ports.
+//
+// At iteration start, the tile serially snapshots every child core's frozen
+// state into the H1 hierarchy node. All child H0 nodes start from the same
+// iter_start pulse, so no level observes a partially committed state vector.
 module h1_tile #(
     parameter int H0_COUNT          = 16,
     parameter int CORES_PER_H0      = 32,
@@ -126,6 +130,9 @@ module h1_tile #(
     assign state_load_core = CORE_ID_W'(int'(state_load_index) % CORES_PER_H0);
     assign h1_partials_done = h1_node_iter_done && parent_done_pending;
 
+    // ------------------------------------------------------------------
+    // Child H0 tiles
+    // ------------------------------------------------------------------
     generate
         for (genvar h0_index = 0; h0_index < H0_COUNT; h0_index++) begin : gen_h0_tiles
             h0_tile #(
@@ -173,6 +180,7 @@ module h1_tile #(
         end
     endgenerate
 
+    // Cross-H0 interaction engine for blocks owned by this H1.
     hierarchy_node #(
         .STATE_ENTRY_COUNT(H1_STATE_COUNT),
         .MVM_COUNT(H1_MVM_COUNT),
@@ -203,6 +211,7 @@ module h1_tile #(
         .partial_last_o(node_partial_last)
     );
 
+    // Merge H1-local and parent-level partials onto the child H0 inputs.
     h1_child_adapter #(
         .CHILD_COUNT(H0_COUNT),
         .BLOCKS_PER_CHILD(CORES_PER_H0),
@@ -227,6 +236,9 @@ module h1_tile #(
         .child_partial_block_id_o(h0_ext_partial_block_id)
     );
 
+    // ------------------------------------------------------------------
+    // Frozen-state publication and iteration lifecycle
+    // ------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst) begin
             tile_state <= TILE_IDLE;
@@ -278,4 +290,3 @@ module h1_tile #(
         endcase
     end
 endmodule
-

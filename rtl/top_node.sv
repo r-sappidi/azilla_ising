@@ -5,6 +5,11 @@ import ising_pkg::*;
 // it injects STATE/EPOCH_DONE packets and receives PARTIAL/EPOCH_DONE packets.
 //
 // link index: 0=north, 1=south, 2=east, 3=west.
+//
+// Local injection has two producers: the H1 adapter and cross_h1_node. Local
+// ejection has two consumers: STATE goes to cross_h1_node; all other packet
+// types go to the H1 adapter. Packet ownership is locked through `last` in
+// both the local arbiter and the FlooNoC router.
 module top_node #(
     parameter int STATE_ENTRY_COUNT  = 32768,
     parameter int MVM_COUNT          = 16,
@@ -236,7 +241,7 @@ module top_node #(
         end
     end
 
-    noc_router #(
+    azilla_floo_router #(
         .X_W(X_W),
         .Y_W(Y_W),
         .SOURCE_ID_W(SOURCE_ID_W),

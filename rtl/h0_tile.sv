@@ -3,6 +3,10 @@ import ising_pkg::*;
 // Complete H0 tile: 32 spin cores, one generic hierarchy compute node, and an
 // H0-local adapter. Higher-level partials enter through a separate stream
 // and are delivered directly to the addressed core's external accumulator.
+//
+// Iteration startup copies each core's frozen state into the H0 hierarchy
+// node's local state table. The H0 node then evaluates only interactions
+// between different cores in this tile; diagonal blocks stay in spin_core.
 module h0_tile #(
     parameter int CORE_COUNT        = 32,
     parameter int MVM_COUNT         = 16,
@@ -96,6 +100,9 @@ module h0_tile #(
     assign node_state_valid = tile_state == TILE_LOAD_STATES;
     assign partials_done_to_cores = node_iter_done && ext_partials_done_pending;
 
+    // ------------------------------------------------------------------
+    // Resident spin endpoints
+    // ------------------------------------------------------------------
     generate
         for (genvar core_index = 0; core_index < CORE_COUNT; core_index++) begin : gen_spin_cores
             spin_core core (
@@ -130,6 +137,7 @@ module h0_tile #(
         end
     endgenerate
 
+    // Cross-core interaction engine for blocks owned by this H0.
     hierarchy_node #(
         .STATE_ENTRY_COUNT(CORE_COUNT),
         .MVM_COUNT(MVM_COUNT),
@@ -160,6 +168,7 @@ module h0_tile #(
         .partial_last_o(node_partial_last)
     );
 
+    // Route each H0 result back to the core identified by its global block ID.
     h0_adapter #(
         .CORE_COUNT(CORE_COUNT),
         .MVM_COUNT(MVM_COUNT),
@@ -195,6 +204,9 @@ module h0_tile #(
         end
     end
 
+    // ------------------------------------------------------------------
+    // Frozen-state publication and iteration lifecycle
+    // ------------------------------------------------------------------
     always_ff @(posedge clk) begin
         if (rst) begin
             tile_state <= TILE_IDLE;

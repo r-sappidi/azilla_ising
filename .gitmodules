@@ -1,0 +1,6 @@
+[submodule "rtl/FlooNoC"]
+	path = rtl/FlooNoC
+	url = https://github.com/pulp-platform/FlooNoC.git
+[submodule "third_party/ramulator2"]
+	path = third_party/ramulator2
+	url = https://github.com/CMU-SAFARI/ramulator2.git

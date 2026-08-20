@@ -543,7 +543,7 @@ not that every transfer must occur in a fixed cycle slot.
 
 ## 18. Top-level NoC implementation
 
-The top-level network is divided into `noc_router`, `cross_h1_node`,
+The top-level network is divided into `azilla_floo_router`, `cross_h1_node`,
 `top_node`, `h1_noc_adapter`, `mesh_h1_tile`, and `ising_mesh`.
 
 ### 18.1 Packet format
@@ -559,18 +559,19 @@ Defined packet types are `NOC_STATE`, `NOC_PARTIAL`, and `NOC_EPOCH_DONE`.
 Metadata is repeated with every flit. A transfer occurs only on valid and ready.
 The producer must hold the complete flit stable while stalled.
 
-### 18.2 NoC router
+### 18.2 FlooNoC router wrapper
 
-`noc_router` has five ports: local, north, south, east, and west. Every input
-owns a parameterizable FIFO, defaulting to eight flits. Routing is deterministic
-XY: X displacement is resolved before Y displacement, and a matching coordinate
-is delivered locally. Increasing Y travels south and decreasing Y travels
-north.
+`azilla_floo_router` adapts Azilla's five logical ports (local, north, south,
+east, and west) and packet sidebands to the vendored FlooNoC request/response
+types. FlooNoC provides parameterized input buffering and deterministic XY
+routing. Increasing Y travels south and decreasing Y travels north.
 
-Every output uses round-robin arbitration. Once a non-tail flit is accepted,
-the output locks to that input until an accepted flit asserts `last`. This
-prevents packets from being interleaved while allowing different outputs to
-operate concurrently.
+The FlooNoC router performs output arbitration and wormhole packet locking.
+Once a non-tail flit is accepted, the output remains assigned to that packet
+until an accepted flit asserts `last`. This prevents packet interleaving while
+allowing different outputs to operate concurrently. The Azilla wrapper keeps
+the existing ready/valid link contract and isolates the rest of the design
+from FlooNoC-specific types.
 
 ### 18.3 Cross-H1 node
 
@@ -648,7 +649,7 @@ The repository contains independent testbenches for:
 - `h0_adapter`
 - `h0_tile`
 - `h1_tile`
-- `noc_router`
+- `azilla_floo_router`
 - `top_node`
 - `h1_noc_adapter`
 
@@ -657,10 +658,10 @@ cross-H0 J block, verifies both directions of the symmetric computation, routes
 the resulting partials into different child H0s, and checks the resulting spin
 states.
 
-The router test verifies XY direction selection, local delivery, output
-contention, and packet locking. The top-node test receives state packets through
-the router, performs a known cross-H1 symmetric block evaluation, delivers one
-partial locally, and routes the other partial to the east link.
+The FlooNoC wrapper test verifies XY direction selection, local delivery,
+output contention, and packet locking. The top-node test receives state packets
+through the router, performs a known cross-H1 symmetric block evaluation,
+delivers one partial locally, and routes the other partial to the east link.
 
 These tests validate functional composition. They are not yet substitutes for:
 
@@ -715,7 +716,8 @@ stable implementation specification:
 | `rtl/h0_tile.sv` | Spin cores, H0 compute node, and H0 control integration |
 | `rtl/h1_child_adapter.sv` | H1/parent result routing to child H0s |
 | `rtl/h1_tile.sv` | H0 children, H1 compute node, and H1 control integration |
-| `rtl/noc_router.sv` | Buffered five-port deterministic XY router |
+| `rtl/azilla_floo_router.sv` | Azilla packet wrapper around the FlooNoC router |
+| `rtl/floo_router_files.f` | FlooNoC compilation source list |
 | `rtl/cross_h1_node.sv` | State receiver and scheduled cross-H1 computation |
 | `rtl/top_node.sv` | Router, cross-H1 endpoint, and local H1 packet interface |
 | `rtl/h1_noc_adapter.sv` | Translation between H1 parent traffic and top-node packets |

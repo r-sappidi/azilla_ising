@@ -6,6 +6,8 @@ import ising_pkg::*;
 // to one of the H0 tile's spin cores. Each core is an independent output bank,
 // so transfers to different cores proceed concurrently. A fixed-priority
 // arbiter resolves collisions at each core and locks for the complete packet.
+// Global block IDs in [BASE_BLOCK_ID, BASE_BLOCK_ID+CORE_COUNT) map directly
+// to the corresponding core index. IDs outside that range are not consumed.
 module h0_adapter #(
     parameter int CORE_COUNT        = 32,
     parameter int MVM_COUNT         = 16,
@@ -33,6 +35,9 @@ module h0_adapter #(
     logic [CORE_COUNT-1:0] selected_valid;
     logic [CORE_COUNT-1:0] selected_last;
 
+    // Select independently for every destination core. An unlocked output
+    // chooses the lowest-numbered requesting engine; a locked output ignores
+    // all other engines until the accepted tail flit.
     always_comb begin
         partial_ready_o = '0;
         core_partial_valid_o = '0;

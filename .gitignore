@@ -1,0 +1,9 @@
+# Verilator and other generated build products
+/build/
+/logs/
+
+# Local editor and waveform artifacts
+*.vcd
+*.fst
+*.swp
+*~

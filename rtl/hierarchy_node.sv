@@ -14,6 +14,16 @@ import ising_pkg::*;
 //     partial_b = transpose(J_ab) * x_a
 //
 // Diagonal J_aa blocks normally remain private to the spin cores.
+//
+// Per-engine flow:
+//
+//   command -> fill one of two J slots -> symmetric MVM
+//           -> one of two result slots -> A packet -> B packet
+//
+// The two J slots overlap memory delivery with compute. The two result slots
+// independently overlap compute with output backpressure. `schedule_done_i`
+// means no more commands will be issued; `iter_done` additionally requires
+// every J slot, MVM, and result slot to have drained.
 module hierarchy_node #(
     parameter int STATE_ENTRY_COUNT = 32,
     parameter int MVM_COUNT         = 16,
@@ -94,7 +104,8 @@ module hierarchy_node #(
         OUTPUT_SEND_B
     } output_state_t;
 
-    node_state_t node_state, node_state_n;
+    node_state_t node_state;
+    node_state_t node_state_n;
     engine_state_t engine_state [0:MVM_COUNT-1];
     engine_state_t engine_state_n [0:MVM_COUNT-1];
     output_state_t output_state [0:MVM_COUNT-1];
@@ -157,7 +168,7 @@ module hierarchy_node #(
     logic [GLOBAL_BLOCK_ID_W-1:0]
         engine_result_block_b [0:MVM_COUNT-1][0:1];
 
-    // Result serializer and reduction-fabric request signals.
+    // Result serializer and downstream-fabric request signals.
     logic [PARTIAL_BEAT_W-1:0] engine_partial_beat [0:MVM_COUNT-1];
     logic [MVM_COUNT-1:0] engine_partial_valid;
     // High for one cycle when this engine's current partial beat is selected
@@ -274,7 +285,7 @@ module hierarchy_node #(
     end
 
     // ---------------------------------------------------------------------
-    // DMA interface
+    // Command and weight-stream acceptance
     // ---------------------------------------------------------------------
     always_comb begin
         dma_cmd_ready_o = '0;

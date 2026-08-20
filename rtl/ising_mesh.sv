@@ -2,6 +2,11 @@ import ising_pkg::*;
 
 // Parameterized rectangular mesh of complete H1 locations. All scheduling and
 // memory streams are exposed per node for direct testbench stimulation.
+//
+// Node IDs are row-major: node = y*MESH_X_COUNT + x. The wrapper contains no
+// global scheduler or barrier controller; it only instantiates tiles and wires
+// their cardinal ready/valid links. Boundary inputs are tied inactive and
+// boundary outputs are kept ready so an invalid route cannot deadlock the mesh.
 module ising_mesh #(
     parameter int MESH_X_COUNT          = 2,
     parameter int MESH_Y_COUNT          = 2,

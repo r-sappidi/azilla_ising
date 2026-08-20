@@ -4,6 +4,14 @@ import ising_pkg::*;
 // hierarchy below one H1, its H1/NoC protocol adapter, the local cross-H1
 // compute endpoint, and the mesh router. Schedule and memory traffic remain
 // external so a testbench can drive them directly.
+//
+// Dataflow at this level:
+//
+//   h1_tile <-> h1_noc_adapter <-> top_node <-> cardinal mesh links
+//                                      `-> cross_h1_node
+//
+// The direct state_current connection is publication data selection only; it
+// does not bypass packet transport to remote cross-H1 state tables.
 module mesh_h1_tile #(
     parameter int H0_COUNT             = 16,
     parameter int CORES_PER_H0         = 32,

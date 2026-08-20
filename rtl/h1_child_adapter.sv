@@ -7,6 +7,10 @@ import ising_pkg::*;
 // addressed 32-spin block. Each H0 has one external-partial input, so a
 // fixed-priority arbiter selects one source per child and locks that selection
 // for the complete fixed-length partial packet.
+//
+// Source IDs 0..MVM_COUNT-1 identify H1-local engines. Source MVM_COUNT is the
+// single parent stream. Parent packets have no explicit `last`, so this module
+// derives their tail from the fixed four-flit partial length.
 module h1_child_adapter #(
     parameter int CHILD_COUNT       = 16,
     parameter int BLOCKS_PER_CHILD  = 32,
@@ -55,12 +59,13 @@ module h1_child_adapter #(
     );
         int unsigned first_block;
         int unsigned final_block;
+        int unsigned decoded_block;
         begin
             first_block = BASE_BLOCK_ID + child_index * BLOCKS_PER_CHILD;
             final_block = first_block + BLOCKS_PER_CHILD;
+            decoded_block = int'(block_id);
             block_belongs_to_child =
-                block_id >= GLOBAL_BLOCK_ID_W'(first_block) &&
-                block_id <  GLOBAL_BLOCK_ID_W'(final_block);
+                decoded_block >= first_block && decoded_block < final_block;
         end
     endfunction
 
@@ -182,4 +187,3 @@ module h1_child_adapter #(
         end
     end
 endmodule
-

@@ -6,6 +6,10 @@ import ising_pkg::*;
 // external schedule/weight streamer then drives a generic hierarchy node for
 // the H1 pairs assigned to this endpoint. Completed partials from all MVM
 // engines are arbitrated onto one packet stream for injection into the NoC.
+//
+// A cross-H1 scheduler may place work at any mesh location. Therefore the
+// state table is indexed by global block ID, and each result independently
+// derives its destination H1 and XY coordinate from that global ID.
 module cross_h1_node #(
     parameter int STATE_ENTRY_COUNT  = 32768,
     parameter int MVM_COUNT          = 16,
@@ -91,7 +95,7 @@ module cross_h1_node #(
     assign state_ready_o = hierarchy_state_ready;
     assign hierarchy_state_valid = state_valid_i &&
         state_type_i == NOC_STATE && state_epoch_i == epoch_i &&
-        state_block_id_i < GLOBAL_BLOCK_ID_W'(STATE_ENTRY_COUNT);
+        int'(state_block_id_i) < STATE_ENTRY_COUNT;
     assign hierarchy_state_index = STATE_INDEX_W'(state_block_id_i);
 
     hierarchy_node #(
