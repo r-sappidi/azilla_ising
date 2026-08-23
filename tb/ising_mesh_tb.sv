@@ -26,6 +26,7 @@ module ising_mesh_tb #(
     parameter int MEM_LANES          = 16,
     parameter int ITERATION_COUNT    = 1,
     parameter int CLK_PERIOD_NS      = 10,
+    parameter int RAMULATOR_TCK_PS   = 250,
     parameter int COEFF_A_VALUE      = 0,
     parameter int COEFF_B_VALUE      = 1,
     parameter int COEFF_C_VALUE      = 0,
@@ -54,6 +55,11 @@ module ising_mesh_tb #(
         (TOP_STATE_ENTRY_COUNT > 1) ? $clog2(TOP_STATE_ENTRY_COUNT) : 1;
     localparam int WEIGHT_BEATS = SPIN_COUNT * SPIN_COUNT * WEIGHT_W / DATA_W;
     localparam int DRAM_SYSTEM_COUNT = TOTAL_H0_COUNT + 2*NODE_COUNT;
+    localparam int CLK_PERIOD_PS = CLK_PERIOD_NS * 1000;
+    localparam int SAFE_RAMULATOR_TCK_PS =
+        (RAMULATOR_TCK_PS > 0) ? RAMULATOR_TCK_PS : 1;
+    localparam int RAMULATOR_TICKS_PER_CYCLE =
+        CLK_PERIOD_PS / SAFE_RAMULATOR_TCK_PS;
 
     logic clk;
     logic rst;
@@ -176,8 +182,22 @@ module ising_mesh_tb #(
     int h1_next_engine [0:NODE_COUNT-1];
     int cross_next_engine [0:NODE_COUNT-1];
 
+    typedef struct {
+        int block_a;
+        int block_b;
+    } block_work_t;
+    // Flatten the owner/engine dimensions before the queue dimension. Some
+    // older simulator releases mishandle an unpacked dimension of size one followed
+    // by a queue, silently retaining only one descriptor.
+    block_work_t h0_work_queue [0:TOTAL_H0_COUNT*H0_MVM_COUNT-1][$];
+    block_work_t h1_work_queue [0:NODE_COUNT*H1_MVM_COUNT-1][$];
+    block_work_t cross_work_queue [0:NODE_COUNT*CROSS_MVM_COUNT-1][$];
+
     string dataset_name;
     string dataset_path;
+    string schedule_path;
+    string matlab_golden_path;
+    int matlab_golden_file;
     int dataset_vertex_count;
     longint dataset_known_cut;
     longint dataset_edge_records;
@@ -187,6 +207,7 @@ module ising_mesh_tb #(
     longint issued_cross_blocks;
     longint published_states;
     bit verbose_blocks;
+    bit external_schedule;
 
     // Testbench-only NoC instrumentation. Physical-link counters observe each
     // directed router output once, so a flit crossing H hops contributes H
@@ -214,6 +235,14 @@ module ising_mesh_tb #(
     logic [NODE_COUNT-1:0] noc_local_out_valid, noc_local_out_ready;
     logic [NODE_COUNT-1:0][1:0] noc_local_out_type;
     logic [NODE_COUNT-1:0] noc_local_out_last;
+    logic [NODE_COUNT-1:0][H0_COUNT-1:0][H0_MVM_COUNT-1:0]
+        h0_cmd_accepted;
+    logic [NODE_COUNT-1:0][H1_MVM_COUNT-1:0] h1_cmd_accepted;
+    logic [NODE_COUNT-1:0][CROSS_MVM_COUNT-1:0] cross_cmd_accepted;
+    logic [NODE_COUNT-1:0][H0_COUNT-1:0][H0_MVM_COUNT-1:0]
+        h0_cmd_pending;
+    logic [NODE_COUNT-1:0][H1_MVM_COUNT-1:0] h1_cmd_pending;
+    logic [NODE_COUNT-1:0][CROSS_MVM_COUNT-1:0] cross_cmd_pending;
 
     import "DPI-C" function void az_dram_init(
         input string config_path,
@@ -367,11 +396,10 @@ module ising_mesh_tb #(
     initial clk = 1'b0;
     always #(CLK_PERIOD_NS/2) clk = ~clk;
 
-    // The projected 32-Gb/s GDDR configuration has a 250-ps command clock.
-    // Four Ramulator ticks therefore elapse per 1-ns accelerator cycle.
+    // Advance modeled DRAM time by exactly one accelerator clock period.
     always @(negedge clk)
         if (USE_RAMULATOR && !rst)
-            az_dram_tick(4);
+            az_dram_tick(RAMULATOR_TICKS_PER_CYCLE);
 
     always_ff @(posedge clk) begin
         if (rst)
@@ -848,7 +876,20 @@ module ising_mesh_tb #(
         int block_a, block_b;
         int h1_a, h1_b, owner;
         publication_needed.delete();
-        if (SKIP_ZERO_BLOCKS) begin
+        if (external_schedule) begin
+            for (int queue_index = 0;
+                 queue_index < NODE_COUNT*CROSS_MVM_COUNT; queue_index++) begin
+                owner = queue_index / CROSS_MVM_COUNT;
+                for (int work_index = 0;
+                     work_index < cross_work_queue[queue_index].size(); work_index++) begin
+                    mark_publication(
+                        cross_work_queue[queue_index][work_index].block_a, owner);
+                    mark_publication(
+                        cross_work_queue[queue_index][work_index].block_b, owner);
+                end
+            end
+        end
+        else if (SKIP_ZERO_BLOCKS) begin
             foreach (active_block_pair[key]) begin
                 block_a = int'(key >> 32);
                 block_b = int'(key[31:0]);
@@ -878,19 +919,17 @@ module ising_mesh_tb #(
         end
     endtask
 
-    task automatic send_h0_block(input int block_a, input int block_b);
+    task automatic send_h0_block(input int block_a, input int block_b,
+                                 input int engine);
         int global_h0;
         int node_id;
         int h0_id;
-        int engine;
         global_h0 = block_a / CORES_PER_H0;
         node_id = global_h0 / H0_COUNT;
         h0_id = global_h0 % H0_COUNT;
-        engine = h0_next_engine[global_h0];
         if (verbose_blocks)
             $display("issue H0 block (%0d,%0d) node=%0d h0=%0d engine=%0d cycle=%0d",
                      block_a, block_b, node_id, h0_id, engine, cycle_count);
-        h0_next_engine[global_h0] = (engine + 1) % H0_MVM_COUNT;
         @(negedge clk);
         h0_src_state_a[node_id][h0_id][engine] =
             H0_STATE_INDEX_W'(block_a % CORES_PER_H0);
@@ -912,18 +951,15 @@ module ising_mesh_tb #(
             end
             h0_src_weight_valid[node_id][h0_id][engine] = 1'b0;
         end
-        issued_h0_blocks++;
     endtask
 
-    task automatic send_h1_block(input int block_a, input int block_b);
+    task automatic send_h1_block(input int block_a, input int block_b,
+                                 input int engine);
         int node_id;
-        int engine;
         node_id = block_a / BLOCKS_PER_H1;
-        engine = h1_next_engine[node_id];
         if (verbose_blocks)
             $display("issue H1 block (%0d,%0d) node=%0d engine=%0d cycle=%0d",
                      block_a, block_b, node_id, engine, cycle_count);
-        h1_next_engine[node_id] = (engine + 1) % H1_MVM_COUNT;
         @(negedge clk);
         h1_src_state_a[node_id][engine] =
             H1_STATE_INDEX_W'(block_a % BLOCKS_PER_H1);
@@ -944,19 +980,16 @@ module ising_mesh_tb #(
             end
             h1_src_weight_valid[node_id][engine] = 1'b0;
         end
-        issued_h1_blocks++;
     endtask
 
-    task automatic send_cross_block(input int block_a, input int block_b);
-        int h1_a, h1_b, owner, engine;
+    task automatic send_cross_block(input int block_a, input int block_b,
+                                    input int owner, input int engine);
+        int h1_a, h1_b;
         h1_a = block_a / BLOCKS_PER_H1;
         h1_b = block_b / BLOCKS_PER_H1;
-        owner = pair_owner[h1_a*NODE_COUNT + h1_b];
-        engine = cross_next_engine[owner];
         if (verbose_blocks)
             $display("issue cross block (%0d,%0d) owner=%0d engine=%0d cycle=%0d",
                      block_a, block_b, owner, engine, cycle_count);
-        cross_next_engine[owner] = (engine + 1) % CROSS_MVM_COUNT;
         @(negedge clk);
         cross_src_state_a[owner][engine] = TOP_STATE_INDEX_W'(block_a);
         cross_src_state_b[owner][engine] = TOP_STATE_INDEX_W'(block_b);
@@ -975,38 +1008,295 @@ module ising_mesh_tb #(
             end
             cross_src_weight_valid[owner][engine] = 1'b0;
         end
-        issued_cross_blocks++;
     endtask
 
-    task automatic send_block_pair(input int block_a, input int block_b);
-        int h0_a, h0_b, h1_a, h1_b;
+    task automatic enqueue_mapped_pair(input int block_a, input int block_b,
+                                       input int requested_owner,
+                                       input int requested_engine);
+        int h0_a, h0_b, h1_a, h1_b, engine, owner;
+        block_work_t work;
+        work.block_a = block_a;
+        work.block_b = block_b;
+        if (block_a < 0 || block_b < 0 ||
+            block_a >= TOTAL_BLOCK_COUNT || block_b >= TOTAL_BLOCK_COUNT ||
+            block_a >= block_b)
+            $fatal(1, "invalid scheduled block pair (%0d,%0d)",
+                   block_a, block_b);
         h0_a = block_a / CORES_PER_H0;
         h0_b = block_b / CORES_PER_H0;
         h1_a = block_a / BLOCKS_PER_H1;
         h1_b = block_b / BLOCKS_PER_H1;
-        if (h0_a == h0_b)
-            send_h0_block(block_a, block_b);
-        else if (h1_a == h1_b)
-            send_h1_block(block_a, block_b);
-        else
-            send_cross_block(block_a, block_b);
+        if (h0_a == h0_b) begin
+            engine = requested_engine >= 0 ? requested_engine : h0_next_engine[h0_a];
+            if (engine >= H0_MVM_COUNT)
+                $fatal(1, "H0 engine %0d out of range", engine);
+            h0_next_engine[h0_a] = (engine + 1) % H0_MVM_COUNT;
+            h0_work_queue[h0_a*H0_MVM_COUNT+engine].push_back(work);
+            issued_h0_blocks++;
+        end
+        else if (h1_a == h1_b) begin
+            engine = requested_engine >= 0 ? requested_engine : h1_next_engine[h1_a];
+            if (engine >= H1_MVM_COUNT)
+                $fatal(1, "H1 engine %0d out of range", engine);
+            h1_next_engine[h1_a] = (engine + 1) % H1_MVM_COUNT;
+            h1_work_queue[h1_a*H1_MVM_COUNT+engine].push_back(work);
+            issued_h1_blocks++;
+        end
+        else begin
+            owner = requested_owner >= 0 ? requested_owner :
+                    pair_owner[h1_a*NODE_COUNT + h1_b];
+            if (owner >= NODE_COUNT)
+                $fatal(1, "cross owner %0d out of range", owner);
+            engine = requested_engine >= 0 ? requested_engine : cross_next_engine[owner];
+            if (engine >= CROSS_MVM_COUNT)
+                $fatal(1, "cross engine %0d out of range", engine);
+            cross_next_engine[owner] = (engine + 1) % CROSS_MVM_COUNT;
+            cross_work_queue[owner*CROSS_MVM_COUNT+engine].push_back(work);
+            issued_cross_blocks++;
+        end
     endtask
 
-    task automatic drive_schedule;
+    task automatic enqueue_block_pair(input int block_a, input int block_b);
+        enqueue_mapped_pair(block_a, block_b, -1, -1);
+    endtask
+
+    task automatic compile_schedule;
         longint unsigned key;
         int block_a, block_b;
-        if (SKIP_ZERO_BLOCKS) begin
+        int schedule_file;
+        int dump_file;
+        int owner, engine, scan_result;
+        string dump_path;
+        for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
+            for (int engine = 0; engine < H0_MVM_COUNT; engine++)
+                h0_work_queue[h0*H0_MVM_COUNT+engine].delete();
+        for (int node = 0; node < NODE_COUNT; node++) begin
+            for (int engine = 0; engine < H1_MVM_COUNT; engine++)
+                h1_work_queue[node*H1_MVM_COUNT+engine].delete();
+            for (int engine = 0; engine < CROSS_MVM_COUNT; engine++)
+                cross_work_queue[node*CROSS_MVM_COUNT+engine].delete();
+        end
+        external_schedule = $value$plusargs("SCHEDULE=%s", schedule_path);
+        if (external_schedule) begin
+            schedule_file = $fopen(schedule_path, "r");
+            if (schedule_file == 0)
+                $fatal(1, "cannot open schedule file %s", schedule_path);
+            while (!$feof(schedule_file)) begin
+                scan_result = $fscanf(schedule_file, "%d %d %d %d\n",
+                                      block_a, block_b, owner, engine);
+                if (scan_result == 4)
+                    enqueue_mapped_pair(block_a, block_b, owner, engine);
+                else if (scan_result != -1)
+                    $fatal(1, "invalid schedule record in %s", schedule_path);
+            end
+            $fclose(schedule_file);
+            $display("loaded runtime schedule %s", schedule_path);
+        end
+        else if (SKIP_ZERO_BLOCKS) begin
             foreach (active_block_pair[key]) begin
                 block_a = int'(key >> 32);
                 block_b = int'(key[31:0]);
-                send_block_pair(block_a, block_b);
+                enqueue_block_pair(block_a, block_b);
             end
         end
         else begin
             for (block_a = 0; block_a < TOTAL_BLOCK_COUNT; block_a++)
                 for (block_b = block_a + 1; block_b < TOTAL_BLOCK_COUNT; block_b++)
-                    send_block_pair(block_a, block_b);
+                    enqueue_block_pair(block_a, block_b);
         end
+        if ($value$plusargs("DUMP_SCHEDULE=%s", dump_path)) begin
+            dump_file = $fopen(dump_path, "w");
+            if (dump_file == 0)
+                $fatal(1, "cannot create schedule file %s", dump_path);
+            for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
+                for (int e = 0; e < H0_MVM_COUNT; e++)
+                    for (int w = 0;
+                         w < h0_work_queue[h0*H0_MVM_COUNT+e].size(); w++)
+                        $fdisplay(dump_file, "%0d %0d -1 %0d",
+                            h0_work_queue[h0*H0_MVM_COUNT+e][w].block_a,
+                            h0_work_queue[h0*H0_MVM_COUNT+e][w].block_b, e);
+            for (int node = 0; node < NODE_COUNT; node++) begin
+                for (int e = 0; e < H1_MVM_COUNT; e++)
+                    for (int w = 0;
+                         w < h1_work_queue[node*H1_MVM_COUNT+e].size(); w++)
+                        $fdisplay(dump_file, "%0d %0d -1 %0d",
+                            h1_work_queue[node*H1_MVM_COUNT+e][w].block_a,
+                            h1_work_queue[node*H1_MVM_COUNT+e][w].block_b, e);
+                for (int e = 0; e < CROSS_MVM_COUNT; e++)
+                    for (int w = 0;
+                         w < cross_work_queue[node*CROSS_MVM_COUNT+e].size(); w++)
+                        $fdisplay(dump_file, "%0d %0d %0d %0d",
+                            cross_work_queue[node*CROSS_MVM_COUNT+e][w].block_a,
+                            cross_work_queue[node*CROSS_MVM_COUNT+e][w].block_b,
+                            node, e);
+            end
+            $fclose(dump_file);
+            $display("wrote runtime schedule %s", dump_path);
+        end
+    endtask
+
+    task automatic dispatch_h0_engine(input int global_h0, input int engine);
+        block_work_t work;
+        while (h0_work_queue[global_h0*H0_MVM_COUNT+engine].size() != 0) begin
+            work = h0_work_queue[global_h0*H0_MVM_COUNT+engine].pop_front();
+            send_h0_block(work.block_a, work.block_b, engine);
+        end
+    endtask
+
+    task automatic dispatch_h1_engine(input int node, input int engine);
+        block_work_t work;
+        while (h1_work_queue[node*H1_MVM_COUNT+engine].size() != 0) begin
+            work = h1_work_queue[node*H1_MVM_COUNT+engine].pop_front();
+            send_h1_block(work.block_a, work.block_b, engine);
+        end
+    endtask
+
+    task automatic dispatch_cross_engine(input int node, input int engine);
+        block_work_t work;
+        while (cross_work_queue[node*CROSS_MVM_COUNT+engine].size() != 0) begin
+            work = cross_work_queue[node*CROSS_MVM_COUNT+engine].pop_front();
+            send_cross_block(work.block_a, work.block_b, node, engine);
+        end
+    endtask
+
+    // Ramulator-mode commands carry no inline weight stream, so every engine
+    // port can be serviced independently from one cycle-driven dispatcher.
+    // A blocked port retains valid and metadata while unrelated ports advance.
+    task automatic dispatch_ramulator_schedule;
+        longint remaining;
+        longint dispatch_cycles;
+        longint remaining_h0;
+        longint remaining_h1;
+        longint remaining_cross;
+        block_work_t work;
+        remaining = issued_h0_blocks + issued_h1_blocks + issued_cross_blocks;
+        dispatch_cycles = 0;
+        remaining_h0 = issued_h0_blocks;
+        remaining_h1 = issued_h1_blocks;
+        remaining_cross = issued_cross_blocks;
+        h0_cmd_accepted = '0;
+        h1_cmd_accepted = '0;
+        cross_cmd_accepted = '0;
+        h0_cmd_pending = '0;
+        h1_cmd_pending = '0;
+        cross_cmd_pending = '0;
+        $display("compiled concurrent schedule h0=%0d h1=%0d cross=%0d total=%0d",
+                 issued_h0_blocks, issued_h1_blocks, issued_cross_blocks,
+                 remaining);
+        while (remaining != 0) begin
+            @(negedge clk);
+            dispatch_cycles++;
+            for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++) begin
+                int node;
+                int local_h0;
+                node = h0 / H0_COUNT;
+                local_h0 = h0 % H0_COUNT;
+                for (int engine = 0; engine < H0_MVM_COUNT; engine++) begin
+                    if (h0_cmd_accepted[node][local_h0][engine]) begin
+                        h0_src_cmd_valid[node][local_h0][engine] = 1'b0;
+                        h0_cmd_pending[node][local_h0][engine] = 1'b0;
+                        remaining--;
+                        remaining_h0--;
+                    end
+                    else if (!h0_cmd_pending[node][local_h0][engine] &&
+                        h0_work_queue[h0*H0_MVM_COUNT+engine].size() != 0) begin
+                        work = h0_work_queue[h0*H0_MVM_COUNT+engine].pop_front();
+                        h0_src_state_a[node][local_h0][engine] =
+                            H0_STATE_INDEX_W'(work.block_a % CORES_PER_H0);
+                        h0_src_state_b[node][local_h0][engine] =
+                            H0_STATE_INDEX_W'(work.block_b % CORES_PER_H0);
+                        h0_src_block_a[node][local_h0][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_a);
+                        h0_src_block_b[node][local_h0][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_b);
+                        h0_src_cmd_valid[node][local_h0][engine] = 1'b1;
+                        h0_cmd_pending[node][local_h0][engine] = 1'b1;
+                    end
+                end
+            end
+            for (int node = 0; node < NODE_COUNT; node++) begin
+                for (int engine = 0; engine < H1_MVM_COUNT; engine++) begin
+                    if (h1_cmd_accepted[node][engine]) begin
+                        h1_src_cmd_valid[node][engine] = 1'b0;
+                        h1_cmd_pending[node][engine] = 1'b0;
+                        remaining--;
+                        remaining_h1--;
+                    end
+                    else if (!h1_cmd_pending[node][engine] &&
+                        h1_work_queue[node*H1_MVM_COUNT+engine].size() != 0) begin
+                        work = h1_work_queue[node*H1_MVM_COUNT+engine].pop_front();
+                        h1_src_state_a[node][engine] =
+                            H1_STATE_INDEX_W'(work.block_a % BLOCKS_PER_H1);
+                        h1_src_state_b[node][engine] =
+                            H1_STATE_INDEX_W'(work.block_b % BLOCKS_PER_H1);
+                        h1_src_block_a[node][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_a);
+                        h1_src_block_b[node][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_b);
+                        h1_src_cmd_valid[node][engine] = 1'b1;
+                        h1_cmd_pending[node][engine] = 1'b1;
+                    end
+                end
+                for (int engine = 0; engine < CROSS_MVM_COUNT; engine++) begin
+                    if (cross_cmd_accepted[node][engine]) begin
+                        cross_src_cmd_valid[node][engine] = 1'b0;
+                        cross_cmd_pending[node][engine] = 1'b0;
+                        remaining--;
+                        remaining_cross--;
+                    end
+                    else if (!cross_cmd_pending[node][engine] &&
+                        cross_work_queue[node*CROSS_MVM_COUNT+engine].size() != 0) begin
+                        work = cross_work_queue[node*CROSS_MVM_COUNT+engine].pop_front();
+                        cross_src_state_a[node][engine] =
+                            TOP_STATE_INDEX_W'(work.block_a);
+                        cross_src_state_b[node][engine] =
+                            TOP_STATE_INDEX_W'(work.block_b);
+                        cross_src_block_a[node][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_a);
+                        cross_src_block_b[node][engine] =
+                            GLOBAL_BLOCK_ID_W'(work.block_b);
+                        cross_src_cmd_valid[node][engine] = 1'b1;
+                        cross_cmd_pending[node][engine] = 1'b1;
+                    end
+                end
+            end
+            if ((dispatch_cycles % 100_000) == 0) begin
+                $display("concurrent dispatch cycle=%0d remaining=%0d h0=%0d h1=%0d cross=%0d",
+                         dispatch_cycles, remaining, remaining_h0,
+                         remaining_h1, remaining_cross);
+            end
+            if (remaining < 0)
+                $fatal(1, "concurrent dispatcher accepted more commands than queued");
+
+            // Valid and ready are now stable for the upcoming rising edge.
+            // Retire that transfer on the next pass, after the edge occurred.
+            h0_cmd_accepted = h0_src_cmd_valid & h0_src_cmd_ready;
+            h1_cmd_accepted = h1_src_cmd_valid & h1_src_cmd_ready;
+            cross_cmd_accepted = cross_src_cmd_valid & cross_src_cmd_ready;
+        end
+        @(negedge clk);
+        h0_src_cmd_valid = '0;
+        h1_src_cmd_valid = '0;
+        cross_src_cmd_valid = '0;
+    endtask
+
+    task automatic dispatch_direct_schedule;
+        for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
+            for (int engine = 0; engine < H0_MVM_COUNT; engine++)
+                dispatch_h0_engine(h0, engine);
+        for (int node = 0; node < NODE_COUNT; node++) begin
+            for (int engine = 0; engine < H1_MVM_COUNT; engine++)
+                dispatch_h1_engine(node, engine);
+            for (int engine = 0; engine < CROSS_MVM_COUNT; engine++)
+                dispatch_cross_engine(node, engine);
+        end
+    endtask
+
+    task automatic drive_schedule;
+        if (USE_RAMULATOR)
+            dispatch_ramulator_schedule();
+        else
+            dispatch_direct_schedule();
     endtask
 
     task automatic pulse_schedule_done;
@@ -1234,7 +1524,14 @@ module ising_mesh_tb #(
 
     task automatic check_next_state(input int iteration);
         int errors;
+        int matlab_expected;
+        int matlab_scan_result;
         int block_id, node_id, local_block, h0_id, core_id, spin_id;
+`ifdef AZILLA_TIMING_ONLY
+        $display("iteration=%0d timing-only: functional state comparison skipped",
+                 iteration);
+        return;
+`endif
         errors = 0;
         for (int spin = 0; spin < TOTAL_SPIN_COUNT; spin++) begin
             block_id = spin / SPIN_COUNT;
@@ -1243,6 +1540,16 @@ module ising_mesh_tb #(
             local_block = block_id % BLOCKS_PER_H1;
             h0_id = local_block / CORES_PER_H0;
             core_id = local_block % CORES_PER_H0;
+            if (matlab_golden_file != 0) begin
+                matlab_scan_result = $fscanf(matlab_golden_file, "%d", matlab_expected);
+                if (matlab_scan_result != 1 ||
+                    (matlab_expected != 0 && matlab_expected != 1))
+                    $fatal(1, "invalid MATLAB golden value at iteration %0d spin %0d",
+                           iteration, spin);
+                if (golden_next[spin] !== bit'(matlab_expected))
+                    $fatal(1, "MATLAB/internal golden mismatch at iteration %0d spin %0d: MATLAB=%0d internal=%0b",
+                           iteration, spin, matlab_expected, golden_next[spin]);
+            end
             if (state_next_o[node_id][h0_id][core_id][spin_id] !==
                 golden_next[spin]) begin
                 if (errors < 16)
@@ -1265,12 +1572,37 @@ module ising_mesh_tb #(
         longint unsigned publication_key;
         int publication_block;
         int publication_owner;
+        int matlab_spin_count;
+        int matlab_iteration_count;
+        int matlab_header_result;
 
+        if (RAMULATOR_TCK_PS <= 0)
+            $fatal(1, "RAMULATOR_TCK_PS must be positive");
+        if ((CLK_PERIOD_PS % SAFE_RAMULATOR_TCK_PS) != 0)
+            $fatal(1,
+                   "CLK_PERIOD_NS (%0d ns) must be an integer multiple of RAMULATOR_TCK_PS (%0d ps)",
+                   CLK_PERIOD_NS, RAMULATOR_TCK_PS);
         validate_configuration();
         initialize_inputs();
         verbose_blocks = $test$plusargs("VERBOSE_BLOCKS");
         rst = 1'b1;
         load_dataset();
+        matlab_golden_file = 0;
+        if ($value$plusargs("MATLAB_GOLDEN=%s", matlab_golden_path)) begin
+            matlab_golden_file = $fopen(matlab_golden_path, "r");
+            if (matlab_golden_file == 0)
+                $fatal(1, "cannot open MATLAB golden file %s", matlab_golden_path);
+            matlab_header_result = $fscanf(matlab_golden_file, "%d %d",
+                                            matlab_spin_count,
+                                            matlab_iteration_count);
+            if (matlab_header_result != 2 ||
+                matlab_spin_count != TOTAL_SPIN_COUNT ||
+                matlab_iteration_count != ITERATION_COUNT)
+                $fatal(1, "MATLAB golden header mismatch: got spins=%0d iterations=%0d, expected spins=%0d iterations=%0d",
+                       matlab_spin_count, matlab_iteration_count,
+                       TOTAL_SPIN_COUNT, ITERATION_COUNT);
+            $display("using MATLAB golden states from %s", matlab_golden_path);
+        end
         if (USE_RAMULATOR)
             az_dram_init("tb/ramulator_128x32.yaml", dataset_path,
                          DRAM_SYSTEM_COUNT, TOTAL_BLOCK_COUNT);
@@ -1322,6 +1654,7 @@ module ising_mesh_tb #(
             @(negedge clk);
             iter_start_i = '0;
 
+            compile_schedule();
             prepare_publications();
             $display("iteration %0d: publishing states", iteration);
             foreach (publication_needed[publication_key]) begin
@@ -1372,6 +1705,8 @@ module ising_mesh_tb #(
             az_dram_report();
             az_dram_finalize();
         end
+        if (matlab_golden_file != 0)
+            $fclose(matlab_golden_file);
         $finish;
     end
-endmodule 
+endmodule

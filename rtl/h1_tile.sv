@@ -279,8 +279,12 @@ module h1_tile #(
             end
             TILE_START_NODE: tile_state_n = TILE_RUN;
             TILE_RUN: begin
+                // Child cores expose completion before this wrapper has
+                // necessarily entered TILE_DONE. Accept a simultaneous
+                // commit so every physical tile returns to TILE_IDLE and can
+                // observe the next iteration's start pulse.
                 if (iter_done)
-                    tile_state_n = TILE_DONE;
+                    tile_state_n = commit ? TILE_IDLE : TILE_DONE;
             end
             TILE_DONE: begin
                 if (commit)

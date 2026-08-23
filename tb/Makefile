@@ -17,13 +17,15 @@ MEM_PIN_COUNT ?= 128
 MEM_PIN_GBPS ?= 32
 MEM_LANES ?= 16
 ITERATION_COUNT ?= 1
+TIMING_ONLY ?= 0
 COEFF_A_VALUE ?= 0
 COEFF_B_VALUE ?= 1
 NOISE_AMPLITUDE ?= 0
 DATASET ?= g256_smoke.txt
 NOC_STATS_FILE ?= noc_stats.csv
-FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_s$(SKIP_ZERO_BLOCKS)_r$(USE_RAMULATOR)_i$(ITERATION_COUNT)
+FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_s$(SKIP_ZERO_BLOCKS)_r$(USE_RAMULATOR)_i$(ITERATION_COUNT)_t$(TIMING_ONLY)
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
+TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
 
 .PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test clean
 
@@ -74,11 +76,44 @@ dram-streamer-test:
 		$(abspath ramulator_dpi.cpp)
 	cd .. && build/dram_weight_streamer_tb/Vdram_weight_streamer_tb
 
+# Single-node dense throughput microbenchmark used by the parameter sweep.
+PERF_MVM_COUNT ?= 4
+PERF_OUTPUT_LANES ?= 1
+PERF_WORK_BLOCKS ?= 256
+PERF_TOTAL_BLOCKS ?= 2048
+PERF_STATE_ENTRIES ?= 64
+PERF_MEM_LANES ?= 16
+PERF_MAX_OUTSTANDING ?= 64
+PERF_DATASET ?= g65536_kings.txt
+PERF_CONFIG := m$(PERF_MVM_COUNT)_o$(PERF_OUTPUT_LANES)_b$(PERF_WORK_BLOCKS)_l$(PERF_MEM_LANES)
+
+ramulator-node-perf-test:
+	mkdir -p ../build/ramulator_node_perf_$(PERF_CONFIG)
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal -Wno-TIMESCALEMOD \
+		--top-module ramulator_node_perf_tb \
+		--Mdir build/ramulator_node_perf_$(PERF_CONFIG) \
+		-GMVM_COUNT=$(PERF_MVM_COUNT) \
+		-GOUTPUT_LANES=$(PERF_OUTPUT_LANES) \
+		-GWORK_BLOCK_COUNT=$(PERF_WORK_BLOCKS) \
+		-GTOTAL_BLOCK_COUNT=$(PERF_TOTAL_BLOCKS) \
+		-GSTATE_ENTRY_COUNT=$(PERF_STATE_ENTRIES) \
+		-GMEM_LANES=$(PERF_MEM_LANES) \
+		-GMAX_OUTSTANDING=$(PERF_MAX_OUTSTANDING) \
+		-CFLAGS "-std=c++20 -I$(abspath $(RAMULATOR_DIR))/src" \
+		-LDFLAGS "-L$(abspath $(RAMULATOR_DIR)) -lramulator -Wl,-rpath,$(abspath $(RAMULATOR_DIR))" \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv rtl/symmetric_mvm.sv \
+		rtl/hierarchy_node.sv rtl/dram_weight_streamer.sv \
+		tb/ramulator_dpi_bridge.sv tb/ramulator_node_frontend.sv \
+		tb/ramulator_node_perf_tb.sv $(abspath ramulator_dpi.cpp)
+	cd .. && build/ramulator_node_perf_$(PERF_CONFIG)/Vramulator_node_perf_tb \
+		+DATASET=$(PERF_DATASET)
+
 # Full accelerator hierarchy elaboration/reset smoke test using FlooNoC at
 # every top-level mesh location.
 floo-mesh-test:
 	mkdir -p $(FLOO_BUILD_DIR)
 	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		$(TIMING_ONLY_FLAG) \
 		--top-module ising_mesh_tb \
 		--Mdir build/$(notdir $(FLOO_BUILD_DIR)) \
 		-GMESH_X_COUNT=$(MESH_X_COUNT) \
@@ -95,6 +130,9 @@ floo-mesh-test:
 		-GMEM_PIN_GBPS=$(MEM_PIN_GBPS) \
 		-GMEM_LANES=$(MEM_LANES) \
 		-GITERATION_COUNT=$(ITERATION_COUNT) \
+		-GCOEFF_A_VALUE=$(COEFF_A_VALUE) \
+		-GCOEFF_B_VALUE=$(COEFF_B_VALUE) \
+		-GNOISE_AMPLITUDE=$(NOISE_AMPLITUDE) \
 		-CFLAGS "-std=c++20 -I$(abspath $(RAMULATOR_DIR))/src" \
 		-LDFLAGS "-L$(abspath $(RAMULATOR_DIR)) -lramulator -Wl,-rpath,$(abspath $(RAMULATOR_DIR))" \
 		-f rtl/floo_router_files.f \
@@ -113,7 +151,7 @@ floo-mesh-test:
 		+DATASET=$(DATASET) +NOC_STATS_FILE=$(NOC_STATS_FILE) $(SIM_ARGS)
 
 # Full hierarchy with node-local Ramulator-backed projected GDDR interfaces.
-floo-mesh-dram-test: 
+floo-mesh-dram-test:
 	AZILLA_MEM_PINS=$(MEM_PIN_COUNT) AZILLA_MEM_PIN_GBPS=$(MEM_PIN_GBPS) \
 		PYTHONPATH=$(abspath $(RAMULATOR_DIR))/python \
 		python3 -m ramulator export ramulator_config.py -o ramulator_128x32.yaml

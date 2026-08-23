@@ -248,8 +248,12 @@ module h0_tile #(
             end
             TILE_START_NODE: tile_state_n = TILE_RUN;
             TILE_RUN: begin
+                // `iter_done` is derived directly from the cores. A global
+                // commit may therefore arrive on the same edge that this
+                // wrapper first observes completion. Consume it here instead
+                // of entering TILE_DONE after the one-cycle commit is gone.
                 if (iter_done)
-                    tile_state_n = TILE_DONE;
+                    tile_state_n = commit ? TILE_IDLE : TILE_DONE;
             end
             TILE_DONE: begin
                 if (commit)

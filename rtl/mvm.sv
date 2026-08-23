@@ -31,6 +31,7 @@ module mvm (
     // Combinational dot product for the row returned by the resident SRAM.
     always_comb begin
         row_dot_product = '0;
+`ifndef AZILLA_TIMING_ONLY
         for (int column = 0; column < SPIN_COUNT; column++) begin
             if (state[column])
                 row_dot_product = row_dot_product +
@@ -39,6 +40,7 @@ module mvm (
                 row_dot_product = row_dot_product -
                     ACC_W'($signed(weight_data_i[column*WEIGHT_W +: WEIGHT_W]));
         end
+`endif
     end
 
     always_ff @(posedge clk) begin

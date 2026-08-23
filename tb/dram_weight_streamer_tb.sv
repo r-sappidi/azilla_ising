@@ -3,6 +3,10 @@
 import ising_pkg::*;
 
 module dram_weight_streamer_tb;
+    localparam int CLK_PERIOD_PS = 1000;
+    localparam int RAMULATOR_TCK_PS = 250;
+    localparam int RAMULATOR_TICKS_PER_CYCLE =
+        CLK_PERIOD_PS / RAMULATOR_TCK_PS;
     localparam int MVM_COUNT = 2;
     localparam int STATE_INDEX_W = 3;
     localparam int GLOBAL_BLOCK_ID_W = 3;
@@ -100,7 +104,7 @@ module dram_weight_streamer_tb;
     endfunction
 
     always @(negedge clk)
-        if (!rst) az_dram_tick(4);
+        if (!rst) az_dram_tick(RAMULATOR_TICKS_PER_CYCLE);
 
     always @(posedge clk) begin
         for (int engine = 0; engine < MVM_COUNT; engine++) begin

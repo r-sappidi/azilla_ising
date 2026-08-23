@@ -35,6 +35,7 @@ module symmetric_mvm (
     // Complete the normal-direction dot product for the current row.
     always_comb begin
         row_dot_product = '0;
+`ifndef AZILLA_TIMING_ONLY
         for (int column = 0; column < SPIN_COUNT; column++) begin
             if (state_b[column])
                 row_dot_product = row_dot_product +
@@ -43,6 +44,7 @@ module symmetric_mvm (
                 row_dot_product = row_dot_product -
                     ACC_W'($signed(weight_data_i[column*WEIGHT_W +: WEIGHT_W]));
         end
+`endif
     end
 
     always_ff @(posedge clk) begin
@@ -78,6 +80,7 @@ module symmetric_mvm (
 
                 // The same row contributes one signed term to every output of
                 // transpose(J_ab)*x_a.
+`ifndef AZILLA_TIMING_ONLY
                 for (int column = 0; column < SPIN_COUNT; column++) begin
                     if (state_a[process_row])
                         result_b[column] <= result_b[column] +
@@ -86,6 +89,7 @@ module symmetric_mvm (
                         result_b[column] <= result_b[column] -
                             ACC_W'($signed(weight_data_i[column*WEIGHT_W +: WEIGHT_W]));
                 end
+`endif
 
                 if (process_row == ROW_W'(SPIN_COUNT-1)) begin
                     active <= 1'b0;
