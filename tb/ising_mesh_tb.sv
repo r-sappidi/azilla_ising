@@ -188,6 +188,33 @@ module ising_mesh_tb #(
     longint published_states;
     bit verbose_blocks;
 
+    // Testbench-only NoC instrumentation. Physical-link counters observe each
+    // directed router output once, so a flit crossing H hops contributes H
+    // transfers. Local counters separately capture endpoint injection/ejection.
+    longint unsigned noc_monitor_cycles;
+    longint unsigned noc_link_offered [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_link_accepted [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_link_stalled [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_link_packets [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_link_type_flits [0:NODE_COUNT-1][0:3][0:3];
+    longint unsigned noc_inject_offered [0:NODE_COUNT-1];
+    longint unsigned noc_inject_accepted [0:NODE_COUNT-1];
+    longint unsigned noc_inject_stalled [0:NODE_COUNT-1];
+    longint unsigned noc_inject_packets [0:NODE_COUNT-1];
+    longint unsigned noc_inject_type_flits [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_eject_offered [0:NODE_COUNT-1];
+    longint unsigned noc_eject_accepted [0:NODE_COUNT-1];
+    longint unsigned noc_eject_stalled [0:NODE_COUNT-1];
+    longint unsigned noc_eject_packets [0:NODE_COUNT-1];
+    longint unsigned noc_eject_type_flits [0:NODE_COUNT-1][0:3];
+    logic noc_stats_active;
+    logic [NODE_COUNT-1:0] noc_local_in_valid, noc_local_in_ready;
+    logic [NODE_COUNT-1:0][1:0] noc_local_in_type;
+    logic [NODE_COUNT-1:0] noc_local_in_last;
+    logic [NODE_COUNT-1:0] noc_local_out_valid, noc_local_out_ready;
+    logic [NODE_COUNT-1:0][1:0] noc_local_out_type;
+    logic [NODE_COUNT-1:0] noc_local_out_last;
+
     import "DPI-C" function void az_dram_init(
         input string config_path,
         input string dataset_path,
@@ -353,6 +380,140 @@ module ising_mesh_tb #(
             cycle_count <= cycle_count + 1;
             if (cycle_count >= MAX_CYCLES)
                 $fatal(1, "timeout after %0d cycles", cycle_count);
+        end
+    end
+
+    // FlooNoC's local router port is port zero. Fixed generate indices make
+    // these internal handshake signals available to the generic monitor below.
+    for (genvar y = 0; y < MESH_Y_COUNT; y++) begin : noc_monitor_y
+        for (genvar x = 0; x < MESH_X_COUNT; x++) begin : noc_monitor_x
+            localparam int N = y*MESH_X_COUNT + x;
+            assign noc_local_in_valid[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_valid[0];
+            assign noc_local_in_ready[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_ready[0];
+            assign noc_local_in_type[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_type[0];
+            assign noc_local_in_last[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_last[0];
+            assign noc_local_out_valid[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_valid[0];
+            assign noc_local_out_ready[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_ready[0];
+            assign noc_local_out_type[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_type[0];
+            assign noc_local_out_last[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_last[0];
+        end
+    end
+
+    function automatic bit is_physical_noc_link(input int node, input int dir);
+        int x;
+        int y;
+        x = node % MESH_X_COUNT;
+        y = node / MESH_X_COUNT;
+        case (dir)
+            0: return y > 0;                  // north
+            1: return y+1 < MESH_Y_COUNT;     // south
+            2: return x+1 < MESH_X_COUNT;     // east
+            default: return x > 0;            // west
+        endcase
+    endfunction
+
+    function automatic int noc_type_index(input logic [1:0] packet_type);
+        case (packet_type)
+            NOC_STATE: return 0;
+            NOC_PARTIAL: return 1;
+            NOC_EPOCH_DONE: return 2;
+            default: return 3;
+        endcase
+    endfunction
+
+    function automatic string noc_direction_name(input int dir);
+        case (dir)
+            0: return "north";
+            1: return "south";
+            2: return "east";
+            default: return "west";
+        endcase
+    endfunction
+
+    always @(posedge clk) begin : collect_noc_statistics
+        int packet_type;
+        if (rst) begin
+            noc_stats_active = 1'b0;
+            noc_monitor_cycles = 0;
+            for (int node = 0; node < NODE_COUNT; node++) begin
+                noc_inject_offered[node] = 0;
+                noc_inject_accepted[node] = 0;
+                noc_inject_stalled[node] = 0;
+                noc_inject_packets[node] = 0;
+                noc_eject_offered[node] = 0;
+                noc_eject_accepted[node] = 0;
+                noc_eject_stalled[node] = 0;
+                noc_eject_packets[node] = 0;
+                for (int packet = 0; packet < 4; packet++) begin
+                    noc_inject_type_flits[node][packet] = 0;
+                    noc_eject_type_flits[node][packet] = 0;
+                end
+                for (int dir = 0; dir < 4; dir++) begin
+                    noc_link_offered[node][dir] = 0;
+                    noc_link_accepted[node][dir] = 0;
+                    noc_link_stalled[node][dir] = 0;
+                    noc_link_packets[node][dir] = 0;
+                    for (int packet = 0; packet < 4; packet++)
+                        noc_link_type_flits[node][dir][packet] = 0;
+                end
+            end
+        end
+        else begin
+            if (|iter_start_i)
+                noc_stats_active = 1'b1;
+            if (noc_stats_active) begin
+                noc_monitor_cycles++;
+                for (int node = 0; node < NODE_COUNT; node++) begin
+                    if (noc_local_in_valid[node]) begin
+                        noc_inject_offered[node]++;
+                        if (noc_local_in_ready[node]) begin
+                            noc_inject_accepted[node]++;
+                            packet_type = noc_type_index(noc_local_in_type[node]);
+                            noc_inject_type_flits[node][packet_type]++;
+                            if (noc_local_in_last[node])
+                                noc_inject_packets[node]++;
+                        end
+                        else
+                            noc_inject_stalled[node]++;
+                    end
+                    if (noc_local_out_valid[node]) begin
+                        noc_eject_offered[node]++;
+                        if (noc_local_out_ready[node]) begin
+                            noc_eject_accepted[node]++;
+                            packet_type = noc_type_index(noc_local_out_type[node]);
+                            noc_eject_type_flits[node][packet_type]++;
+                            if (noc_local_out_last[node])
+                                noc_eject_packets[node]++;
+                        end
+                        else
+                            noc_eject_stalled[node]++;
+                    end
+                    for (int dir = 0; dir < 4; dir++) begin
+                        if (is_physical_noc_link(node, dir) &&
+                            dut.link_out_valid[node][dir]) begin
+                            noc_link_offered[node][dir]++;
+                            if (dut.link_out_ready[node][dir]) begin
+                                noc_link_accepted[node][dir]++;
+                                packet_type = noc_type_index(
+                                    dut.link_out_type[node][dir]);
+                                noc_link_type_flits[node][dir][packet_type]++;
+                                if (dut.link_out_last[node][dir])
+                                    noc_link_packets[node][dir]++;
+                            end
+                            else
+                                noc_link_stalled[node][dir]++;
+                        end
+                    end
+                end
+            end
         end
     end
 
@@ -880,6 +1041,136 @@ module ising_mesh_tb #(
         end
     endtask
 
+    task automatic report_noc_statistics;
+        string stats_path;
+        int stats_file;
+        longint unsigned total_injected;
+        longint unsigned total_injected_packets;
+        longint unsigned total_ejected;
+        longint unsigned total_link_flits;
+        longint unsigned total_link_stalls;
+        longint unsigned total_type_flits [0:3];
+        longint unsigned hottest_flits;
+        longint unsigned most_stalls;
+        int hottest_node;
+        int hottest_dir;
+        int stalled_node;
+        int stalled_dir;
+        real utilization;
+        real pressure;
+        real average_hops;
+
+        total_injected = 0;
+        total_injected_packets = 0;
+        total_ejected = 0;
+        total_link_flits = 0;
+        total_link_stalls = 0;
+        hottest_flits = 0;
+        most_stalls = 0;
+        hottest_node = 0;
+        hottest_dir = 0;
+        stalled_node = 0;
+        stalled_dir = 0;
+        for (int packet = 0; packet < 4; packet++)
+            total_type_flits[packet] = 0;
+
+        if (!$value$plusargs("NOC_STATS_FILE=%s", stats_path))
+            stats_path = "noc_stats.csv";
+        stats_file = $fopen(stats_path, "w");
+        if (stats_file == 0)
+            $fatal(1, "could not open NoC statistics file %s", stats_path);
+        $fdisplay(stats_file,
+            "scope,node,x,y,direction,offered_cycles,accepted_flits,stall_cycles,packets,state_flits,partial_flits,epoch_done_flits,other_flits,window_utilization,backpressure_fraction");
+
+        for (int node = 0; node < NODE_COUNT; node++) begin
+            total_injected += noc_inject_accepted[node];
+            total_injected_packets += noc_inject_packets[node];
+            total_ejected += noc_eject_accepted[node];
+            for (int packet = 0; packet < 4; packet++)
+                total_type_flits[packet] += noc_inject_type_flits[node][packet];
+            utilization = noc_monitor_cycles == 0 ? 0.0 :
+                real'(noc_inject_accepted[node]) / real'(noc_monitor_cycles);
+            pressure = noc_inject_offered[node] == 0 ? 0.0 :
+                real'(noc_inject_stalled[node]) / real'(noc_inject_offered[node]);
+            $fdisplay(stats_file,
+                "inject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f",
+                node, node % MESH_X_COUNT, node / MESH_X_COUNT,
+                noc_inject_offered[node], noc_inject_accepted[node],
+                noc_inject_stalled[node], noc_inject_packets[node],
+                noc_inject_type_flits[node][0], noc_inject_type_flits[node][1],
+                noc_inject_type_flits[node][2], noc_inject_type_flits[node][3],
+                utilization, pressure);
+
+            utilization = noc_monitor_cycles == 0 ? 0.0 :
+                real'(noc_eject_accepted[node]) / real'(noc_monitor_cycles);
+            pressure = noc_eject_offered[node] == 0 ? 0.0 :
+                real'(noc_eject_stalled[node]) / real'(noc_eject_offered[node]);
+            $fdisplay(stats_file,
+                "eject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f",
+                node, node % MESH_X_COUNT, node / MESH_X_COUNT,
+                noc_eject_offered[node], noc_eject_accepted[node],
+                noc_eject_stalled[node], noc_eject_packets[node],
+                noc_eject_type_flits[node][0], noc_eject_type_flits[node][1],
+                noc_eject_type_flits[node][2], noc_eject_type_flits[node][3],
+                utilization, pressure);
+
+            for (int dir = 0; dir < 4; dir++) begin
+                if (is_physical_noc_link(node, dir)) begin
+                    total_link_flits += noc_link_accepted[node][dir];
+                    total_link_stalls += noc_link_stalled[node][dir];
+                    if (noc_link_accepted[node][dir] > hottest_flits) begin
+                        hottest_flits = noc_link_accepted[node][dir];
+                        hottest_node = node;
+                        hottest_dir = dir;
+                    end
+                    if (noc_link_stalled[node][dir] > most_stalls) begin
+                        most_stalls = noc_link_stalled[node][dir];
+                        stalled_node = node;
+                        stalled_dir = dir;
+                    end
+                    utilization = noc_monitor_cycles == 0 ? 0.0 :
+                        real'(noc_link_accepted[node][dir]) /
+                        real'(noc_monitor_cycles);
+                    pressure = noc_link_offered[node][dir] == 0 ? 0.0 :
+                        real'(noc_link_stalled[node][dir]) /
+                        real'(noc_link_offered[node][dir]);
+                    $fdisplay(stats_file,
+                        "link,%0d,%0d,%0d,%s,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f",
+                        node, node % MESH_X_COUNT, node / MESH_X_COUNT,
+                        noc_direction_name(dir), noc_link_offered[node][dir],
+                        noc_link_accepted[node][dir], noc_link_stalled[node][dir],
+                        noc_link_packets[node][dir],
+                        noc_link_type_flits[node][dir][0],
+                        noc_link_type_flits[node][dir][1],
+                        noc_link_type_flits[node][dir][2],
+                        noc_link_type_flits[node][dir][3], utilization, pressure);
+                end
+            end
+        end
+        $fclose(stats_file);
+
+        average_hops = total_injected == 0 ? 0.0 :
+            real'(total_link_flits) / real'(total_injected);
+        $display("NOC summary window_cycles=%0d injected_flits=%0d ejected_flits=%0d physical_link_flits=%0d average_hops=%0.3f link_stall_cycles=%0d",
+                 noc_monitor_cycles, total_injected, total_ejected,
+                 total_link_flits, average_hops, total_link_stalls);
+        $display("NOC injected types state=%0d partial=%0d epoch_done=%0d other=%0d packets=%0d",
+                 total_type_flits[0], total_type_flits[1],
+                 total_type_flits[2], total_type_flits[3],
+                 total_injected_packets);
+        $display("NOC busiest link node=%0d (%0d,%0d) dir=%s accepted_flits=%0d utilization=%0.3f%%",
+                 hottest_node, hottest_node % MESH_X_COUNT,
+                 hottest_node / MESH_X_COUNT, noc_direction_name(hottest_dir),
+                 hottest_flits,
+                 noc_monitor_cycles == 0 ? 0.0 :
+                     100.0*real'(hottest_flits)/real'(noc_monitor_cycles));
+        $display("NOC most backpressured link node=%0d (%0d,%0d) dir=%s stall_cycles=%0d",
+                 stalled_node, stalled_node % MESH_X_COUNT,
+                 stalled_node / MESH_X_COUNT, noc_direction_name(stalled_dir),
+                 most_stalls);
+        $display("NOC detailed CSV: %s", stats_path);
+    endtask
+
     logic [NODE_COUNT-1:0] router_activity;
     for (genvar y = 0; y < MESH_Y_COUNT; y++) begin : monitor_y
         for (genvar x = 0; x < MESH_X_COUNT; x++) begin : monitor_x
@@ -1066,14 +1357,21 @@ module ising_mesh_tb #(
             commit_i = '1;
             @(negedge clk);
             commit_i = '0;
+
+            // Cores perform state_current <= state_next while in CORE_COMMIT,
+            // on the following rising edge. Do not compute the next golden
+            // iteration or publish state until that architectural commit has
+            // taken effect everywhere.
+            @(negedge clk);
         end
 
         $display("PASS: %0d iteration(s), skip_zero_blocks=%0b, total_cycles=%0d",
                  ITERATION_COUNT, SKIP_ZERO_BLOCKS, cycle_count);
+        report_noc_statistics();
         if (USE_RAMULATOR) begin
             az_dram_report();
             az_dram_finalize();
         end
         $finish;
     end
-endmodule
+endmodule 

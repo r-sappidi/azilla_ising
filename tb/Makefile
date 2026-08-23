@@ -17,11 +17,15 @@ MEM_PIN_COUNT ?= 128
 MEM_PIN_GBPS ?= 32
 MEM_LANES ?= 16
 ITERATION_COUNT ?= 1
+COEFF_A_VALUE ?= 0
+COEFF_B_VALUE ?= 1
+NOISE_AMPLITUDE ?= 0
 DATASET ?= g256_smoke.txt
+NOC_STATS_FILE ?= noc_stats.csv
 FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_s$(SKIP_ZERO_BLOCKS)_r$(USE_RAMULATOR)_i$(ITERATION_COUNT)
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 
-.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test clean
+.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test clean
 
 all: run
 
@@ -105,10 +109,11 @@ floo-mesh-test:
 		rtl/dram_weight_streamer.sv tb/ramulator_dpi_bridge.sv \
 		tb/ramulator_node_frontend.sv tb/ising_mesh_tb.sv \
 		$(abspath ramulator_dpi.cpp)
-	cd .. && build/$(notdir $(FLOO_BUILD_DIR))/Vising_mesh_tb +DATASET=$(DATASET)
+	cd .. && build/$(notdir $(FLOO_BUILD_DIR))/Vising_mesh_tb \
+		+DATASET=$(DATASET) +NOC_STATS_FILE=$(NOC_STATS_FILE) $(SIM_ARGS)
 
 # Full hierarchy with node-local Ramulator-backed projected GDDR interfaces.
-floo-mesh-dram-test:
+floo-mesh-dram-test: 
 	AZILLA_MEM_PINS=$(MEM_PIN_COUNT) AZILLA_MEM_PIN_GBPS=$(MEM_PIN_GBPS) \
 		PYTHONPATH=$(abspath $(RAMULATOR_DIR))/python \
 		python3 -m ramulator export ramulator_config.py -o ramulator_128x32.yaml

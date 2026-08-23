@@ -111,8 +111,10 @@ module azilla_floo_router #(
     function automatic int floo_port(input int azilla_port);
         case (azilla_port)
             AZ_LOCAL: floo_port = FLOO_LOCAL;
-            AZ_NORTH: floo_port = FLOO_NORTH;
-            AZ_SOUTH: floo_port = FLOO_SOUTH;
+            // Azilla's Y coordinate increases toward SOUTH, while FlooNoC's
+            // increases toward NORTH. The X-axis conventions already agree.
+            AZ_NORTH: floo_port = FLOO_SOUTH;
+            AZ_SOUTH: floo_port = FLOO_NORTH;
             AZ_EAST:  floo_port = FLOO_EAST;
             default:  floo_port = FLOO_WEST;
         endcase
