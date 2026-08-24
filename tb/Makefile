@@ -23,11 +23,27 @@ COEFF_B_VALUE ?= 1
 NOISE_AMPLITUDE ?= 0
 DATASET ?= g256_smoke.txt
 NOC_STATS_FILE ?= noc_stats.csv
+HYBRID_MAX_X ?= 4
+HYBRID_MAX_Y ?= 4
+HYBRID_FIFO_DEPTH ?= 4
+HYBRID_TRAFFIC ?= logs/hybrid_noc.traffic
+HYBRID_STATS_PREFIX ?= logs/hybrid_noc
+HYBRID_STATS_INTERVAL ?= 100
+HYBRID_DATASET ?= tb/datasets/g16384_kings.txt
+HYBRID_SCHEDULE ?=
+HYBRID_MESH_X ?= 4
+HYBRID_MESH_Y ?= 4
+HYBRID_H0_PER_H1 ?= 1
+HYBRID_CROSS_ENGINES ?= 16
+HYBRID_BLOCK_SERVICE_CYCLES ?= 64
+HYBRID_CONFIG := $(HYBRID_MAX_X)x$(HYBRID_MAX_Y)_f$(HYBRID_FIFO_DEPTH)
+HYBRID_BUILD_DIR := ../build/hybrid_noc_$(HYBRID_CONFIG)
+HYBRID_SCHEDULE_ARG = $(if $(HYBRID_SCHEDULE),--schedule $(HYBRID_SCHEDULE),)
 FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_s$(SKIP_ZERO_BLOCKS)_r$(USE_RAMULATOR)_i$(ITERATION_COUNT)_t$(TIMING_ONLY)
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
 
-.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test clean
+.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test clean
 
 all: run
 
@@ -60,6 +76,48 @@ floo-router-test:
 		rtl/ising_pkg.sv rtl/azilla_floo_router.sv \
 		tb/azilla_floo_router_tb.sv
 	../build/azilla_floo_router_tb/Vazilla_floo_router_tb
+
+# Compile the maximum router fabric once. Runtime traffic files may select any
+# rectangular active mesh that fits within HYBRID_MAX_X by HYBRID_MAX_Y.
+$(HYBRID_BUILD_DIR)/Vhybrid_noc_perf_tb: \
+	$(RTL_DIR)/floo_router_files.f \
+	$(RTL_DIR)/ising_pkg.sv \
+	$(RTL_DIR)/azilla_floo_router.sv \
+	hybrid_noc_perf_tb.sv
+	mkdir -p $(HYBRID_BUILD_DIR)
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module hybrid_noc_perf_tb \
+		--Mdir build/$(notdir $(HYBRID_BUILD_DIR)) \
+		-GMAX_MESH_X=$(HYBRID_MAX_X) \
+		-GMAX_MESH_Y=$(HYBRID_MAX_Y) \
+		-GFIFO_DEPTH=$(HYBRID_FIFO_DEPTH) \
+		-f rtl/floo_router_files.f \
+		rtl/ising_pkg.sv rtl/azilla_floo_router.sv \
+		tb/hybrid_noc_perf_tb.sv
+
+hybrid-noc-build: $(HYBRID_BUILD_DIR)/Vhybrid_noc_perf_tb
+
+hybrid-noc-workload:
+	cd .. && python3 scripts/generate_hybrid_noc_workload.py \
+		--dataset $(HYBRID_DATASET) \
+		--output $(HYBRID_TRAFFIC) \
+		--mesh-x $(HYBRID_MESH_X) \
+		--mesh-y $(HYBRID_MESH_Y) \
+		--h0-per-h1 $(HYBRID_H0_PER_H1) \
+		--cross-engines $(HYBRID_CROSS_ENGINES) \
+		--block-service-cycles $(HYBRID_BLOCK_SERVICE_CYCLES) $(HYBRID_SCHEDULE_ARG)
+
+# Replay a runtime-generated hierarchy workload through the real FlooNoC
+# routers and produce CSV files accepted by the existing analysis scripts.
+hybrid-noc-run: $(HYBRID_BUILD_DIR)/Vhybrid_noc_perf_tb
+	cd .. && build/$(notdir $(HYBRID_BUILD_DIR))/Vhybrid_noc_perf_tb \
+		+TRAFFIC=$(HYBRID_TRAFFIC) \
+		+NOC_STATS_FILE=$(HYBRID_STATS_PREFIX).csv \
+		+NOC_TIMELINE_FILE=$(HYBRID_STATS_PREFIX)_timeline.csv \
+		+NOC_EVENT_FILE=$(HYBRID_STATS_PREFIX)_events.csv \
+		+NOC_STATS_INTERVAL=$(HYBRID_STATS_INTERVAL)
+
+hybrid-noc-test: hybrid-noc-workload hybrid-noc-run
 
 RAMULATOR_DIR := ../third_party/ramulator2
 

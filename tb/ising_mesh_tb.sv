@@ -192,6 +192,11 @@ module ising_mesh_tb #(
     block_work_t h0_work_queue [0:TOTAL_H0_COUNT*H0_MVM_COUNT-1][$];
     block_work_t h1_work_queue [0:NODE_COUNT*H1_MVM_COUNT-1][$];
     block_work_t cross_work_queue [0:NODE_COUNT*CROSS_MVM_COUNT-1][$];
+    // Ramulator-mode descriptors wait at the physical compute node until its
+    // ready-aware round-robin dispatcher selects an available engine.
+    block_work_t h0_node_work_queue [0:TOTAL_H0_COUNT-1][$];
+    block_work_t h1_node_work_queue [0:NODE_COUNT-1][$];
+    block_work_t cross_node_work_queue [0:NODE_COUNT-1][$];
 
     string dataset_name;
     string dataset_path;
@@ -232,9 +237,49 @@ module ising_mesh_tb #(
     logic [NODE_COUNT-1:0] noc_local_in_valid, noc_local_in_ready;
     logic [NODE_COUNT-1:0][1:0] noc_local_in_type;
     logic [NODE_COUNT-1:0] noc_local_in_last;
+    logic [NODE_COUNT-1:0][X_W-1:0] noc_local_in_dest_x;
+    logic [NODE_COUNT-1:0][Y_W-1:0] noc_local_in_dest_y;
+    logic [NODE_COUNT-1:0][SOURCE_ID_W-1:0] noc_local_in_source_id;
+    logic [NODE_COUNT-1:0][EPOCH_W-1:0] noc_local_in_epoch;
+    logic [NODE_COUNT-1:0][GLOBAL_BLOCK_ID_W-1:0] noc_local_in_block_id;
     logic [NODE_COUNT-1:0] noc_local_out_valid, noc_local_out_ready;
     logic [NODE_COUNT-1:0][1:0] noc_local_out_type;
     logic [NODE_COUNT-1:0] noc_local_out_last;
+    logic [NODE_COUNT-1:0][X_W-1:0] noc_local_out_dest_x;
+    logic [NODE_COUNT-1:0][Y_W-1:0] noc_local_out_dest_y;
+    logic [NODE_COUNT-1:0][SOURCE_ID_W-1:0] noc_local_out_source_id;
+    logic [NODE_COUNT-1:0][EPOCH_W-1:0] noc_local_out_epoch;
+    logic [NODE_COUNT-1:0][GLOBAL_BLOCK_ID_W-1:0] noc_local_out_block_id;
+
+    // Optional temporal instrumentation. Cumulative aggregate counters above
+    // remain the source of truth; snapshots subtract these saved baselines.
+    int noc_timeline_file;
+    int noc_event_file;
+    int noc_stats_interval;
+    longint noc_trace_start;
+    longint noc_trace_end;
+    int noc_trace_node;
+    longint signed noc_inflight_flits;
+    longint unsigned noc_peak_inflight_flits;
+    longint unsigned noc_interval_start_cycle;
+    longint unsigned noc_prev_link_offered [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_prev_link_accepted [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_prev_link_stalled [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_prev_link_packets [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_prev_link_types [0:NODE_COUNT-1][0:3][0:3];
+    longint unsigned noc_prev_inject_offered [0:NODE_COUNT-1];
+    longint unsigned noc_prev_inject_accepted [0:NODE_COUNT-1];
+    longint unsigned noc_prev_inject_stalled [0:NODE_COUNT-1];
+    longint unsigned noc_prev_inject_packets [0:NODE_COUNT-1];
+    longint unsigned noc_prev_inject_types [0:NODE_COUNT-1][0:3];
+    longint unsigned noc_prev_eject_offered [0:NODE_COUNT-1];
+    longint unsigned noc_prev_eject_accepted [0:NODE_COUNT-1];
+    longint unsigned noc_prev_eject_stalled [0:NODE_COUNT-1];
+    longint unsigned noc_prev_eject_packets [0:NODE_COUNT-1];
+    longint unsigned noc_prev_eject_types [0:NODE_COUNT-1][0:3];
+    bit noc_inject_stall_active [0:NODE_COUNT-1];
+    bit noc_eject_stall_active [0:NODE_COUNT-1];
+    bit noc_link_stall_active [0:NODE_COUNT-1][0:3];
     logic [NODE_COUNT-1:0][H0_COUNT-1:0][H0_MVM_COUNT-1:0]
         h0_cmd_accepted;
     logic [NODE_COUNT-1:0][H1_MVM_COUNT-1:0] h1_cmd_accepted;
@@ -424,6 +469,16 @@ module ising_mesh_tb #(
                 dut.gen_y[y].gen_x[x].tile.top.router_in_type[0];
             assign noc_local_in_last[N] =
                 dut.gen_y[y].gen_x[x].tile.top.router_in_last[0];
+            assign noc_local_in_dest_x[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_dest_x[0];
+            assign noc_local_in_dest_y[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_dest_y[0];
+            assign noc_local_in_source_id[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_source_id[0];
+            assign noc_local_in_epoch[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_epoch[0];
+            assign noc_local_in_block_id[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_in_block_id[0];
             assign noc_local_out_valid[N] =
                 dut.gen_y[y].gen_x[x].tile.top.router_out_valid[0];
             assign noc_local_out_ready[N] =
@@ -432,6 +487,16 @@ module ising_mesh_tb #(
                 dut.gen_y[y].gen_x[x].tile.top.router_out_type[0];
             assign noc_local_out_last[N] =
                 dut.gen_y[y].gen_x[x].tile.top.router_out_last[0];
+            assign noc_local_out_dest_x[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_dest_x[0];
+            assign noc_local_out_dest_y[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_dest_y[0];
+            assign noc_local_out_source_id[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_source_id[0];
+            assign noc_local_out_epoch[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_epoch[0];
+            assign noc_local_out_block_id[N] =
+                dut.gen_y[y].gen_x[x].tile.top.router_out_block_id[0];
         end
     end
 
@@ -466,11 +531,151 @@ module ising_mesh_tb #(
         endcase
     endfunction
 
+    function automatic string noc_stall_event_name(input bit stalled);
+        if (stalled)
+            return "stall_begin";
+        return "stall_end";
+    endfunction
+
+    function automatic bit noc_trace_enabled_for(input int node);
+        return cycle_count >= noc_trace_start && cycle_count <= noc_trace_end &&
+               (noc_trace_node < 0 || noc_trace_node == node);
+    endfunction
+
+    task automatic write_noc_timeline_snapshot(input longint unsigned end_cycle);
+        longint unsigned offered, accepted, stalled, packets;
+        longint unsigned types [0:3];
+        longint unsigned window_cycles;
+        real utilization;
+        real pressure;
+        if (noc_timeline_file == 0 || end_cycle <= noc_interval_start_cycle)
+            return;
+        window_cycles = end_cycle - noc_interval_start_cycle;
+        for (int node = 0; node < NODE_COUNT; node++) begin
+            offered = noc_inject_offered[node] - noc_prev_inject_offered[node];
+            accepted = noc_inject_accepted[node] - noc_prev_inject_accepted[node];
+            stalled = noc_inject_stalled[node] - noc_prev_inject_stalled[node];
+            packets = noc_inject_packets[node] - noc_prev_inject_packets[node];
+            for (int packet = 0; packet < 4; packet++)
+                types[packet] = noc_inject_type_flits[node][packet] -
+                                noc_prev_inject_types[node][packet];
+            utilization = real'(accepted) / real'(window_cycles);
+            pressure = offered == 0 ? 0.0 : real'(stalled) / real'(offered);
+            $fdisplay(noc_timeline_file,
+                "%0d,%0d,inject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f,%0d,%0d",
+                noc_interval_start_cycle, end_cycle, node,
+                node % MESH_X_COUNT, node / MESH_X_COUNT,
+                offered, accepted, stalled, packets, types[0], types[1],
+                types[2], types[3], utilization, pressure,
+                noc_inflight_flits, noc_peak_inflight_flits);
+
+            offered = noc_eject_offered[node] - noc_prev_eject_offered[node];
+            accepted = noc_eject_accepted[node] - noc_prev_eject_accepted[node];
+            stalled = noc_eject_stalled[node] - noc_prev_eject_stalled[node];
+            packets = noc_eject_packets[node] - noc_prev_eject_packets[node];
+            for (int packet = 0; packet < 4; packet++)
+                types[packet] = noc_eject_type_flits[node][packet] -
+                                noc_prev_eject_types[node][packet];
+            utilization = real'(accepted) / real'(window_cycles);
+            pressure = offered == 0 ? 0.0 : real'(stalled) / real'(offered);
+            $fdisplay(noc_timeline_file,
+                "%0d,%0d,eject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f,%0d,%0d",
+                noc_interval_start_cycle, end_cycle, node,
+                node % MESH_X_COUNT, node / MESH_X_COUNT,
+                offered, accepted, stalled, packets, types[0], types[1],
+                types[2], types[3], utilization, pressure,
+                noc_inflight_flits, noc_peak_inflight_flits);
+
+            for (int dir = 0; dir < 4; dir++) begin
+                if (is_physical_noc_link(node, dir)) begin
+                    offered = noc_link_offered[node][dir] - noc_prev_link_offered[node][dir];
+                    accepted = noc_link_accepted[node][dir] - noc_prev_link_accepted[node][dir];
+                    stalled = noc_link_stalled[node][dir] - noc_prev_link_stalled[node][dir];
+                    packets = noc_link_packets[node][dir] - noc_prev_link_packets[node][dir];
+                    for (int packet = 0; packet < 4; packet++)
+                        types[packet] = noc_link_type_flits[node][dir][packet] -
+                            noc_prev_link_types[node][dir][packet];
+                    utilization = real'(accepted) / real'(window_cycles);
+                    pressure = offered == 0 ? 0.0 : real'(stalled) / real'(offered);
+                    $fdisplay(noc_timeline_file,
+                        "%0d,%0d,link,%0d,%0d,%0d,%s,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f,%0d,%0d",
+                        noc_interval_start_cycle, end_cycle, node,
+                        node % MESH_X_COUNT, node / MESH_X_COUNT,
+                        noc_direction_name(dir), offered, accepted, stalled,
+                        packets, types[0], types[1], types[2], types[3],
+                        utilization, pressure, noc_inflight_flits,
+                        noc_peak_inflight_flits);
+                end
+            end
+
+            noc_prev_inject_offered[node] = noc_inject_offered[node];
+            noc_prev_inject_accepted[node] = noc_inject_accepted[node];
+            noc_prev_inject_stalled[node] = noc_inject_stalled[node];
+            noc_prev_inject_packets[node] = noc_inject_packets[node];
+            noc_prev_eject_offered[node] = noc_eject_offered[node];
+            noc_prev_eject_accepted[node] = noc_eject_accepted[node];
+            noc_prev_eject_stalled[node] = noc_eject_stalled[node];
+            noc_prev_eject_packets[node] = noc_eject_packets[node];
+            for (int packet = 0; packet < 4; packet++) begin
+                noc_prev_inject_types[node][packet] = noc_inject_type_flits[node][packet];
+                noc_prev_eject_types[node][packet] = noc_eject_type_flits[node][packet];
+            end
+            for (int dir = 0; dir < 4; dir++) begin
+                noc_prev_link_offered[node][dir] = noc_link_offered[node][dir];
+                noc_prev_link_accepted[node][dir] = noc_link_accepted[node][dir];
+                noc_prev_link_stalled[node][dir] = noc_link_stalled[node][dir];
+                noc_prev_link_packets[node][dir] = noc_link_packets[node][dir];
+                for (int packet = 0; packet < 4; packet++)
+                    noc_prev_link_types[node][dir][packet] =
+                        noc_link_type_flits[node][dir][packet];
+            end
+        end
+        noc_interval_start_cycle = end_cycle;
+        $fflush(noc_timeline_file);
+    endtask
+
+    initial begin : configure_noc_temporal_trace
+        string timeline_path;
+        string event_path;
+        noc_timeline_file = 0;
+        noc_event_file = 0;
+        noc_stats_interval = 100;
+        noc_trace_start = 0;
+        noc_trace_end = 64'h7fff_ffff_ffff_ffff;
+        noc_trace_node = -1;
+        void'($value$plusargs("NOC_STATS_INTERVAL=%d", noc_stats_interval));
+        void'($value$plusargs("NOC_TRACE_START=%d", noc_trace_start));
+        void'($value$plusargs("NOC_TRACE_END=%d", noc_trace_end));
+        void'($value$plusargs("NOC_TRACE_NODE=%d", noc_trace_node));
+        if (noc_stats_interval <= 0)
+            $fatal(1, "NOC_STATS_INTERVAL must be positive");
+        if ($value$plusargs("NOC_TIMELINE_FILE=%s", timeline_path)) begin
+            noc_timeline_file = $fopen(timeline_path, "w");
+            if (noc_timeline_file == 0)
+                $fatal(1, "could not open NoC timeline file %s", timeline_path);
+            $fdisplay(noc_timeline_file,
+                "interval_start,interval_end,scope,node,x,y,direction,offered,accepted,stall_cycles,packets,state_flits,partial_flits,epoch_done_flits,other_flits,utilization,backpressure,inflight_end,peak_inflight");
+        end
+        if ($value$plusargs("NOC_EVENT_FILE=%s", event_path)) begin
+            noc_event_file = $fopen(event_path, "w");
+            if (noc_event_file == 0)
+                $fatal(1, "could not open NoC event file %s", event_path);
+            $fdisplay(noc_event_file,
+                "cycle,event,scope,node,x,y,direction,packet_type,source_id,epoch,block_id,dest_x,dest_y,last,valid,ready,inflight");
+        end
+    end
+
     always @(posedge clk) begin : collect_noc_statistics
         int packet_type;
+        int accepted_injections;
+        int accepted_ejections;
+        bit stalled_now;
         if (rst) begin
             noc_stats_active = 1'b0;
             noc_monitor_cycles = 0;
+            noc_inflight_flits = 0;
+            noc_peak_inflight_flits = 0;
+            noc_interval_start_cycle = 0;
             for (int node = 0; node < NODE_COUNT; node++) begin
                 noc_inject_offered[node] = 0;
                 noc_inject_accepted[node] = 0;
@@ -480,50 +685,119 @@ module ising_mesh_tb #(
                 noc_eject_accepted[node] = 0;
                 noc_eject_stalled[node] = 0;
                 noc_eject_packets[node] = 0;
+                noc_inject_stall_active[node] = 0;
+                noc_eject_stall_active[node] = 0;
+                noc_prev_inject_offered[node] = 0;
+                noc_prev_inject_accepted[node] = 0;
+                noc_prev_inject_stalled[node] = 0;
+                noc_prev_inject_packets[node] = 0;
+                noc_prev_eject_offered[node] = 0;
+                noc_prev_eject_accepted[node] = 0;
+                noc_prev_eject_stalled[node] = 0;
+                noc_prev_eject_packets[node] = 0;
                 for (int packet = 0; packet < 4; packet++) begin
                     noc_inject_type_flits[node][packet] = 0;
                     noc_eject_type_flits[node][packet] = 0;
+                    noc_prev_inject_types[node][packet] = 0;
+                    noc_prev_eject_types[node][packet] = 0;
                 end
                 for (int dir = 0; dir < 4; dir++) begin
                     noc_link_offered[node][dir] = 0;
                     noc_link_accepted[node][dir] = 0;
                     noc_link_stalled[node][dir] = 0;
                     noc_link_packets[node][dir] = 0;
-                    for (int packet = 0; packet < 4; packet++)
+                    noc_link_stall_active[node][dir] = 0;
+                    noc_prev_link_offered[node][dir] = 0;
+                    noc_prev_link_accepted[node][dir] = 0;
+                    noc_prev_link_stalled[node][dir] = 0;
+                    noc_prev_link_packets[node][dir] = 0;
+                    for (int packet = 0; packet < 4; packet++) begin
                         noc_link_type_flits[node][dir][packet] = 0;
+                        noc_prev_link_types[node][dir][packet] = 0;
+                    end
                 end
             end
         end
         else begin
-            if (|iter_start_i)
+            if (|iter_start_i && !noc_stats_active) begin
                 noc_stats_active = 1'b1;
+                noc_interval_start_cycle = cycle_count;
+            end
             if (noc_stats_active) begin
+                accepted_injections = 0;
+                accepted_ejections = 0;
                 noc_monitor_cycles++;
                 for (int node = 0; node < NODE_COUNT; node++) begin
                     if (noc_local_in_valid[node]) begin
                         noc_inject_offered[node]++;
                         if (noc_local_in_ready[node]) begin
+                            accepted_injections++;
                             noc_inject_accepted[node]++;
                             packet_type = noc_type_index(noc_local_in_type[node]);
                             noc_inject_type_flits[node][packet_type]++;
                             if (noc_local_in_last[node])
                                 noc_inject_packets[node]++;
+                            if (noc_event_file != 0 && noc_trace_enabled_for(node))
+                                $fdisplay(noc_event_file,
+                                    "%0d,accept,inject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,1,1,%0d",
+                                    cycle_count, node, node % MESH_X_COUNT,
+                                    node / MESH_X_COUNT, noc_local_in_type[node],
+                                    noc_local_in_source_id[node], noc_local_in_epoch[node],
+                                    noc_local_in_block_id[node], noc_local_in_dest_x[node],
+                                    noc_local_in_dest_y[node], noc_local_in_last[node],
+                                    noc_inflight_flits);
                         end
                         else
                             noc_inject_stalled[node]++;
                     end
+                    stalled_now = noc_local_in_valid[node] && !noc_local_in_ready[node];
+                    if (noc_event_file != 0 && noc_trace_enabled_for(node) &&
+                        stalled_now != noc_inject_stall_active[node])
+                        $fdisplay(noc_event_file,
+                            "%0d,%s,inject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                            cycle_count, noc_stall_event_name(stalled_now), node,
+                            node % MESH_X_COUNT, node / MESH_X_COUNT,
+                            noc_local_in_type[node], noc_local_in_source_id[node],
+                            noc_local_in_epoch[node], noc_local_in_block_id[node],
+                            noc_local_in_dest_x[node], noc_local_in_dest_y[node],
+                            noc_local_in_last[node], noc_local_in_valid[node],
+                            noc_local_in_ready[node], noc_inflight_flits);
+                    noc_inject_stall_active[node] = stalled_now;
                     if (noc_local_out_valid[node]) begin
                         noc_eject_offered[node]++;
                         if (noc_local_out_ready[node]) begin
+                            accepted_ejections++;
                             noc_eject_accepted[node]++;
                             packet_type = noc_type_index(noc_local_out_type[node]);
                             noc_eject_type_flits[node][packet_type]++;
                             if (noc_local_out_last[node])
                                 noc_eject_packets[node]++;
+                            if (noc_event_file != 0 && noc_trace_enabled_for(node))
+                                $fdisplay(noc_event_file,
+                                    "%0d,accept,eject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,1,1,%0d",
+                                    cycle_count, node, node % MESH_X_COUNT,
+                                    node / MESH_X_COUNT, noc_local_out_type[node],
+                                    noc_local_out_source_id[node], noc_local_out_epoch[node],
+                                    noc_local_out_block_id[node], noc_local_out_dest_x[node],
+                                    noc_local_out_dest_y[node], noc_local_out_last[node],
+                                    noc_inflight_flits);
                         end
                         else
                             noc_eject_stalled[node]++;
                     end
+                    stalled_now = noc_local_out_valid[node] && !noc_local_out_ready[node];
+                    if (noc_event_file != 0 && noc_trace_enabled_for(node) &&
+                        stalled_now != noc_eject_stall_active[node])
+                        $fdisplay(noc_event_file,
+                            "%0d,%s,eject,%0d,%0d,%0d,local,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                            cycle_count, noc_stall_event_name(stalled_now), node,
+                            node % MESH_X_COUNT, node / MESH_X_COUNT,
+                            noc_local_out_type[node], noc_local_out_source_id[node],
+                            noc_local_out_epoch[node], noc_local_out_block_id[node],
+                            noc_local_out_dest_x[node], noc_local_out_dest_y[node],
+                            noc_local_out_last[node], noc_local_out_valid[node],
+                            noc_local_out_ready[node], noc_inflight_flits);
+                    noc_eject_stall_active[node] = stalled_now;
                     for (int dir = 0; dir < 4; dir++) begin
                         if (is_physical_noc_link(node, dir) &&
                             dut.link_out_valid[node][dir]) begin
@@ -535,12 +809,52 @@ module ising_mesh_tb #(
                                 noc_link_type_flits[node][dir][packet_type]++;
                                 if (dut.link_out_last[node][dir])
                                     noc_link_packets[node][dir]++;
+                                if (noc_event_file != 0 && noc_trace_enabled_for(node))
+                                    $fdisplay(noc_event_file,
+                                        "%0d,accept,link,%0d,%0d,%0d,%s,%0d,%0d,%0d,%0d,%0d,%0d,%0d,1,1,%0d",
+                                        cycle_count, node, node % MESH_X_COUNT,
+                                        node / MESH_X_COUNT, noc_direction_name(dir),
+                                        dut.link_out_type[node][dir],
+                                        dut.link_out_source_id[node][dir],
+                                        dut.link_out_epoch[node][dir],
+                                        dut.link_out_block_id[node][dir],
+                                        dut.link_out_dest_x[node][dir],
+                                        dut.link_out_dest_y[node][dir],
+                                        dut.link_out_last[node][dir], noc_inflight_flits);
                             end
                             else
                                 noc_link_stalled[node][dir]++;
                         end
+                        stalled_now = is_physical_noc_link(node, dir) &&
+                            dut.link_out_valid[node][dir] &&
+                            !dut.link_out_ready[node][dir];
+                        if (noc_event_file != 0 && noc_trace_enabled_for(node) &&
+                            stalled_now != noc_link_stall_active[node][dir])
+                            $fdisplay(noc_event_file,
+                                "%0d,%s,link,%0d,%0d,%0d,%s,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+                                cycle_count, noc_stall_event_name(stalled_now), node,
+                                node % MESH_X_COUNT, node / MESH_X_COUNT,
+                                noc_direction_name(dir), dut.link_out_type[node][dir],
+                                dut.link_out_source_id[node][dir],
+                                dut.link_out_epoch[node][dir],
+                                dut.link_out_block_id[node][dir],
+                                dut.link_out_dest_x[node][dir],
+                                dut.link_out_dest_y[node][dir],
+                                dut.link_out_last[node][dir],
+                                dut.link_out_valid[node][dir],
+                                dut.link_out_ready[node][dir], noc_inflight_flits);
+                        noc_link_stall_active[node][dir] = stalled_now;
                     end
                 end
+                noc_inflight_flits += longint'(accepted_injections) -
+                                      longint'(accepted_ejections);
+                if (noc_inflight_flits < 0)
+                    $fatal(1, "NoC in-flight flit count became negative");
+                if (noc_inflight_flits > noc_peak_inflight_flits)
+                    noc_peak_inflight_flits = noc_inflight_flits;
+                if (noc_timeline_file != 0 &&
+                    noc_monitor_cycles % longint'(noc_stats_interval) == 0)
+                    write_noc_timeline_snapshot(cycle_count + 1);
             end
         end
     end
@@ -877,15 +1191,13 @@ module ising_mesh_tb #(
         int h1_a, h1_b, owner;
         publication_needed.delete();
         if (external_schedule) begin
-            for (int queue_index = 0;
-                 queue_index < NODE_COUNT*CROSS_MVM_COUNT; queue_index++) begin
-                owner = queue_index / CROSS_MVM_COUNT;
+            for (owner = 0; owner < NODE_COUNT; owner++) begin
                 for (int work_index = 0;
-                     work_index < cross_work_queue[queue_index].size(); work_index++) begin
+                     work_index < cross_node_work_queue[owner].size(); work_index++) begin
                     mark_publication(
-                        cross_work_queue[queue_index][work_index].block_a, owner);
+                        cross_node_work_queue[owner][work_index].block_a, owner);
                     mark_publication(
-                        cross_work_queue[queue_index][work_index].block_b, owner);
+                        cross_node_work_queue[owner][work_index].block_b, owner);
                 end
             end
         end
@@ -1057,7 +1369,58 @@ module ising_mesh_tb #(
     endtask
 
     task automatic enqueue_block_pair(input int block_a, input int block_b);
-        enqueue_mapped_pair(block_a, block_b, -1, -1);
+        int h0_a, h0_b, h1_a, h1_b, owner;
+        block_work_t work;
+        if (!USE_RAMULATOR) begin
+            enqueue_mapped_pair(block_a, block_b, -1, -1);
+            return;
+        end
+        work.block_a = block_a;
+        work.block_b = block_b;
+        if (block_a < 0 || block_b < 0 ||
+            block_a >= TOTAL_BLOCK_COUNT || block_b >= TOTAL_BLOCK_COUNT ||
+            block_a >= block_b)
+            $fatal(1, "invalid scheduled block pair (%0d,%0d)",
+                   block_a, block_b);
+        h0_a = block_a / CORES_PER_H0;
+        h0_b = block_b / CORES_PER_H0;
+        h1_a = block_a / BLOCKS_PER_H1;
+        h1_b = block_b / BLOCKS_PER_H1;
+        if (h0_a == h0_b) begin
+            h0_node_work_queue[h0_a].push_back(work);
+            issued_h0_blocks++;
+        end else if (h1_a == h1_b) begin
+            h1_node_work_queue[h1_a].push_back(work);
+            issued_h1_blocks++;
+        end else begin
+            owner = pair_owner[h1_a*NODE_COUNT+h1_b];
+            cross_node_work_queue[owner].push_back(work);
+            issued_cross_blocks++;
+        end
+    endtask
+
+    task automatic enqueue_external_pair(input int block_a, input int block_b,
+                                         input int requested_owner);
+        int h1_a, h1_b;
+        block_work_t work;
+        if (block_a < 0 || block_b < 0 ||
+            block_a >= TOTAL_BLOCK_COUNT || block_b >= TOTAL_BLOCK_COUNT ||
+            block_a >= block_b)
+            $fatal(1, "invalid scheduled block pair (%0d,%0d)",
+                   block_a, block_b);
+        h1_a = block_a / BLOCKS_PER_H1;
+        h1_b = block_b / BLOCKS_PER_H1;
+        if (h1_a != h1_b &&
+            (requested_owner < 0 || requested_owner >= NODE_COUNT))
+            $fatal(1, "cross owner %0d out of range", requested_owner);
+        if (h1_a != h1_b) begin
+            work.block_a = block_a;
+            work.block_b = block_b;
+            cross_node_work_queue[requested_owner].push_back(work);
+            issued_cross_blocks++;
+        end else begin
+            enqueue_block_pair(block_a, block_b);
+        end
     endtask
 
     task automatic compile_schedule;
@@ -1065,12 +1428,16 @@ module ising_mesh_tb #(
         int block_a, block_b;
         int schedule_file;
         int dump_file;
-        int owner, engine, scan_result;
+        int owner, scan_result;
         string dump_path;
+        for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
+            h0_node_work_queue[h0].delete();
         for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
             for (int engine = 0; engine < H0_MVM_COUNT; engine++)
                 h0_work_queue[h0*H0_MVM_COUNT+engine].delete();
         for (int node = 0; node < NODE_COUNT; node++) begin
+            h1_node_work_queue[node].delete();
+            cross_node_work_queue[node].delete();
             for (int engine = 0; engine < H1_MVM_COUNT; engine++)
                 h1_work_queue[node*H1_MVM_COUNT+engine].delete();
             for (int engine = 0; engine < CROSS_MVM_COUNT; engine++)
@@ -1078,14 +1445,16 @@ module ising_mesh_tb #(
         end
         external_schedule = $value$plusargs("SCHEDULE=%s", schedule_path);
         if (external_schedule) begin
+            if (!USE_RAMULATOR)
+                $fatal(1, "runtime schedules require Ramulator mode");
             schedule_file = $fopen(schedule_path, "r");
             if (schedule_file == 0)
                 $fatal(1, "cannot open schedule file %s", schedule_path);
             while (!$feof(schedule_file)) begin
-                scan_result = $fscanf(schedule_file, "%d %d %d %d\n",
-                                      block_a, block_b, owner, engine);
-                if (scan_result == 4)
-                    enqueue_mapped_pair(block_a, block_b, owner, engine);
+                scan_result = $fscanf(schedule_file, "%d %d %d\n",
+                                      block_a, block_b, owner);
+                if (scan_result == 3)
+                    enqueue_external_pair(block_a, block_b, owner);
                 else if (scan_result != -1)
                     $fatal(1, "invalid schedule record in %s", schedule_path);
             end
@@ -1109,26 +1478,19 @@ module ising_mesh_tb #(
             if (dump_file == 0)
                 $fatal(1, "cannot create schedule file %s", dump_path);
             for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++)
-                for (int e = 0; e < H0_MVM_COUNT; e++)
-                    for (int w = 0;
-                         w < h0_work_queue[h0*H0_MVM_COUNT+e].size(); w++)
-                        $fdisplay(dump_file, "%0d %0d -1 %0d",
-                            h0_work_queue[h0*H0_MVM_COUNT+e][w].block_a,
-                            h0_work_queue[h0*H0_MVM_COUNT+e][w].block_b, e);
+                for (int w = 0; w < h0_node_work_queue[h0].size(); w++)
+                    $fdisplay(dump_file, "%0d %0d -1",
+                        h0_node_work_queue[h0][w].block_a,
+                        h0_node_work_queue[h0][w].block_b);
             for (int node = 0; node < NODE_COUNT; node++) begin
-                for (int e = 0; e < H1_MVM_COUNT; e++)
-                    for (int w = 0;
-                         w < h1_work_queue[node*H1_MVM_COUNT+e].size(); w++)
-                        $fdisplay(dump_file, "%0d %0d -1 %0d",
-                            h1_work_queue[node*H1_MVM_COUNT+e][w].block_a,
-                            h1_work_queue[node*H1_MVM_COUNT+e][w].block_b, e);
-                for (int e = 0; e < CROSS_MVM_COUNT; e++)
-                    for (int w = 0;
-                         w < cross_work_queue[node*CROSS_MVM_COUNT+e].size(); w++)
-                        $fdisplay(dump_file, "%0d %0d %0d %0d",
-                            cross_work_queue[node*CROSS_MVM_COUNT+e][w].block_a,
-                            cross_work_queue[node*CROSS_MVM_COUNT+e][w].block_b,
-                            node, e);
+                for (int w = 0; w < h1_node_work_queue[node].size(); w++)
+                    $fdisplay(dump_file, "%0d %0d -1",
+                        h1_node_work_queue[node][w].block_a,
+                        h1_node_work_queue[node][w].block_b);
+                for (int w = 0; w < cross_node_work_queue[node].size(); w++)
+                    $fdisplay(dump_file, "%0d %0d %0d",
+                        cross_node_work_queue[node][w].block_a,
+                        cross_node_work_queue[node][w].block_b, node);
             end
             $fclose(dump_file);
             $display("wrote runtime schedule %s", dump_path);
@@ -1189,6 +1551,7 @@ module ising_mesh_tb #(
             for (int h0 = 0; h0 < TOTAL_H0_COUNT; h0++) begin
                 int node;
                 int local_h0;
+                int base_engine;
                 node = h0 / H0_COUNT;
                 local_h0 = h0 % H0_COUNT;
                 for (int engine = 0; engine < H0_MVM_COUNT; engine++) begin
@@ -1198,9 +1561,16 @@ module ising_mesh_tb #(
                         remaining--;
                         remaining_h0--;
                     end
-                    else if (!h0_cmd_pending[node][local_h0][engine] &&
-                        h0_work_queue[h0*H0_MVM_COUNT+engine].size() != 0) begin
-                        work = h0_work_queue[h0*H0_MVM_COUNT+engine].pop_front();
+                end
+                base_engine = h0_next_engine[h0];
+                for (int offset = 0; offset < H0_MVM_COUNT; offset++) begin
+                    int engine;
+                    engine = (base_engine + offset) % H0_MVM_COUNT;
+                    if (h0_node_work_queue[h0].size() != 0 &&
+                        !h0_cmd_pending[node][local_h0][engine] &&
+                        !h0_cmd_accepted[node][local_h0][engine] &&
+                        h0_src_cmd_ready[node][local_h0][engine]) begin
+                        work = h0_node_work_queue[h0].pop_front();
                         h0_src_state_a[node][local_h0][engine] =
                             H0_STATE_INDEX_W'(work.block_a % CORES_PER_H0);
                         h0_src_state_b[node][local_h0][engine] =
@@ -1211,6 +1581,7 @@ module ising_mesh_tb #(
                             GLOBAL_BLOCK_ID_W'(work.block_b);
                         h0_src_cmd_valid[node][local_h0][engine] = 1'b1;
                         h0_cmd_pending[node][local_h0][engine] = 1'b1;
+                        h0_next_engine[h0] = (engine + 1) % H0_MVM_COUNT;
                     end
                 end
             end
@@ -1222,9 +1593,18 @@ module ising_mesh_tb #(
                         remaining--;
                         remaining_h1--;
                     end
-                    else if (!h1_cmd_pending[node][engine] &&
-                        h1_work_queue[node*H1_MVM_COUNT+engine].size() != 0) begin
-                        work = h1_work_queue[node*H1_MVM_COUNT+engine].pop_front();
+                end
+                begin
+                    int base_engine;
+                    base_engine = h1_next_engine[node];
+                    for (int offset = 0; offset < H1_MVM_COUNT; offset++) begin
+                        int engine;
+                        engine = (base_engine + offset) % H1_MVM_COUNT;
+                        if (h1_node_work_queue[node].size() != 0 &&
+                            !h1_cmd_pending[node][engine] &&
+                            !h1_cmd_accepted[node][engine] &&
+                            h1_src_cmd_ready[node][engine]) begin
+                        work = h1_node_work_queue[node].pop_front();
                         h1_src_state_a[node][engine] =
                             H1_STATE_INDEX_W'(work.block_a % BLOCKS_PER_H1);
                         h1_src_state_b[node][engine] =
@@ -1235,6 +1615,8 @@ module ising_mesh_tb #(
                             GLOBAL_BLOCK_ID_W'(work.block_b);
                         h1_src_cmd_valid[node][engine] = 1'b1;
                         h1_cmd_pending[node][engine] = 1'b1;
+                        h1_next_engine[node] = (engine + 1) % H1_MVM_COUNT;
+                        end
                     end
                 end
                 for (int engine = 0; engine < CROSS_MVM_COUNT; engine++) begin
@@ -1244,9 +1626,18 @@ module ising_mesh_tb #(
                         remaining--;
                         remaining_cross--;
                     end
-                    else if (!cross_cmd_pending[node][engine] &&
-                        cross_work_queue[node*CROSS_MVM_COUNT+engine].size() != 0) begin
-                        work = cross_work_queue[node*CROSS_MVM_COUNT+engine].pop_front();
+                end
+                begin
+                    int base_engine;
+                    base_engine = cross_next_engine[node];
+                    for (int offset = 0; offset < CROSS_MVM_COUNT; offset++) begin
+                        int engine;
+                        engine = (base_engine + offset) % CROSS_MVM_COUNT;
+                        if (cross_node_work_queue[node].size() != 0 &&
+                            !cross_cmd_pending[node][engine] &&
+                            !cross_cmd_accepted[node][engine] &&
+                            cross_src_cmd_ready[node][engine]) begin
+                        work = cross_node_work_queue[node].pop_front();
                         cross_src_state_a[node][engine] =
                             TOP_STATE_INDEX_W'(work.block_a);
                         cross_src_state_b[node][engine] =
@@ -1257,6 +1648,8 @@ module ising_mesh_tb #(
                             GLOBAL_BLOCK_ID_W'(work.block_b);
                         cross_src_cmd_valid[node][engine] = 1'b1;
                         cross_cmd_pending[node][engine] = 1'b1;
+                        cross_next_engine[node] = (engine + 1) % CROSS_MVM_COUNT;
+                        end
                     end
                 end
             end
@@ -1700,7 +2093,12 @@ module ising_mesh_tb #(
 
         $display("PASS: %0d iteration(s), skip_zero_blocks=%0b, total_cycles=%0d",
                  ITERATION_COUNT, SKIP_ZERO_BLOCKS, cycle_count);
+        write_noc_timeline_snapshot(cycle_count);
         report_noc_statistics();
+        if (noc_timeline_file != 0)
+            $fclose(noc_timeline_file);
+        if (noc_event_file != 0)
+            $fclose(noc_event_file);
         if (USE_RAMULATOR) begin
             az_dram_report();
             az_dram_finalize();
