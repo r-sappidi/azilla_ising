@@ -1,7 +1,7 @@
 # Azilla cycle model
 
 For the end-to-end mapping experiment workflow, see
-[`MAPPING_TEST_GUIDE.md`](../MAPPING_TEST_GUIDE.md).
+[`MAPPING_EXPERIMENTS.md`](../MAPPING_EXPERIMENTS.md).
 
 `azilla_cycle_model` is a cycle-stepped executable specification of the RTL.
 It is separate from the hybrid NoC replay: arithmetic values and registered

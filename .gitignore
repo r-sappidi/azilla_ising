@@ -1,10 +1,105 @@
-# Verilator and other generated build products
+# Generated build and experiment products
 /build/
 /logs/
+/results/
+/outputs/
+/mappings/
+/plots/
+/traces/
+/scratch/
+/tmp/
+/temp/
+/noc_stats.csv
+
+# Compiled objects and native libraries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# CMake and package build state
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+dist/
+sdist/
+*.egg-info/
 
 # Local editor and waveform artifacts
 *.vcd
 *.fst
+*.wlf
 *.swp
+*.swo
+*.bak
+*.orig
 *~
-*.md
+.DS_Store
+.idea/
+.vscode/
+
+# HDL simulator and synthesis working state
+work/
+work_*/
+work-obj*.cf
+transcript
+modelsim.ini
+vsim.wlf
+xsim.dir/
+.Xil/
+*.jou
+*.str
+*.pb
+*.vvp
+
+# Python caches, coverage, and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.venv/
+venv/
+env/
+.conda/
+.ipynb_checkpoints/
+
+# Local configuration, profiling, and crash products
+.env
+.env.*
+!.env.example
+*.log
+*.prof
+*.pstats
+*.perf
+core
+core.*
+
+# Locally installed validation tools
+/.tools/
+
+# Local project/model status notes. The comprehensive, researcher-facing
+# mapping workflow remains in MAPPING_EXPERIMENTS.md.
+/MODEL_STATUS.md
+/MAPPING_TEST_GUIDE.md
+
+# Agent/model working notes and local assistant configuration.
+**/AGENTS.md
+**/CLAUDE.md
+**/GEMINI.md
+**/CODEX.md
+**/MODEL_NOTES.md
+**/INTERNAL_NOTES.md
+**/*_INTERNAL.md
+.codex/
+.claude/
+.cursor/
