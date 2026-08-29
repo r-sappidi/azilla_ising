@@ -43,7 +43,49 @@ FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
 
-.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test clean
+.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
+
+cycle-model-compute-trace-build:
+	mkdir -p ../build/cycle_model_compute_trace_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module cycle_model_compute_trace_tb \
+		--Mdir build/cycle_model_compute_trace_tb \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/symmetric_mvm.sv \
+		tb/cycle_model_compute_trace_tb.sv
+
+cycle-model-spin-core-trace-build:
+	mkdir -p ../build/cycle_model_spin_core_trace_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module cycle_model_spin_core_trace_tb \
+		--Mdir build/cycle_model_spin_core_trace_tb \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv rtl/core.sv \
+		tb/cycle_model_spin_core_trace_tb.sv
+
+cycle-model-hierarchy-trace-build:
+	mkdir -p ../build/cycle_model_hierarchy_trace_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module cycle_model_hierarchy_trace_tb \
+		--Mdir build/cycle_model_hierarchy_trace_tb \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/symmetric_mvm.sv \
+		rtl/hierarchy_node.sv tb/cycle_model_hierarchy_trace_tb.sv
+
+cycle-model-router-trace-build:
+	mkdir -p ../build/cycle_model_router_trace_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module cycle_model_router_trace_tb \
+		--Mdir build/cycle_model_router_trace_tb \
+		-f rtl/floo_router_files.f rtl/ising_pkg.sv rtl/azilla_floo_router.sv \
+		tb/cycle_model_router_trace_tb.sv
+
+cycle-model-ramulator-library:
+	mkdir -p ../build/cycle_model_ramulator
+	$(CXX) -std=c++20 -shared -fPIC \
+		-I$(abspath $(RAMULATOR_DIR)/src) -I/usr/share/verilator/include \
+		-I/usr/share/verilator/include/vltstd \
+		$(abspath ramulator_dpi.cpp) \
+		-L$(abspath $(RAMULATOR_DIR)) -lramulator \
+		-Wl,-rpath,$(abspath $(RAMULATOR_DIR)) \
+		-o ../build/cycle_model_ramulator/libazilla_ramulator.so
 
 all: run
 

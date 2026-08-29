@@ -4,6 +4,11 @@ This guide describes the compile-once hybrid NoC model used to compare sparse
 mapping, cross-H1 work placement, and hierarchy configurations without
 re-elaborating the complete accelerator for every experiment.
 
+For end-to-end scalability projections, the preferred path is now the Python
+event-compressed model described in `model/README.md`. The hybrid workflow in
+this document remains useful as an independent real-RTL router replay and NoC
+trace generator; it is not the endpoint/memory performance model.
+
 The model instantiates the real Azilla/FlooNoC router RTL. A software workload
 generator replaces the arithmetic datapaths with timed packet releases. Once
 the maximum router fabric is compiled, mappings and supported runtime
@@ -41,6 +46,61 @@ For a selected configuration, the dataset size must be:
 ```text
 spin_count = mesh_x * mesh_y * h0_per_h1 * 1,024
 ```
+
+## Mapper-to-event interface
+
+The graph partitioner is vendored under
+`model/graph_mapping/graph_compression`. Its sparse entry point avoids a
+dense adjacency matrix and returns:
+
+1. `permutation[new_vertex] = old_vertex`;
+2. the inverse old-to-new permutation;
+3. unique occupied 32-by-32 block coordinates.
+
+`model/azilla_cycle_model/mapping_adapter.py` turns these values into a
+versioned artifact. It fixes local blocks to their RTL H0/H1 resources and
+assigns only cross-H1 blocks to compute owners. This separation is important:
+the generic mapper's free assignment of every tile to an abstract core is not
+a legal representation of Azilla's resident hierarchy.
+
+Create and run an artifact with:
+
+```bash
+PYTHONPATH=model python3 -m azilla_cycle_model.cli map-graph \
+  --dataset tb/datasets/g16384_kings.txt \
+  --output-dir mappings/g16384 \
+  --write-permuted-dataset mappings/g16384/dataset.txt \
+  --mesh-x 4 --mesh-y 4 --h0-per-h1 1 --cores-per-h0 32 \
+  --device cuda --require-cuda
+
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-mapped-events \
+  --artifact mappings/g16384
+```
+
+The artifact also emits `schedule.txt`, so the same mapping can feed this
+document's hybrid replay or the exact arithmetic/Ramulator model. Exact
+functional runs must use the emitted permuted dataset with that schedule.
+Using mapped block coordinates with the original vertex numbering is invalid.
+
+The artifact-direct exact command is:
+
+```bash
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-mapped-ramulator \
+  --artifact mappings/g16384 \
+  --dataset mappings/g16384/dataset.txt \
+  --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
+  --ramulator-config tb/ramulator_128x32.yaml
+```
+
+This uses live Ramulator2 timing rather than the event model's fixed endpoint
+profile. It is cycle-stepped and intended as the exact validation/calibration
+path for selected mapping points.
+
+Alternative algorithms should call
+`artifact_from_mapping(..., owner_assigner=...)`. This provides one stable
+test interface for vertex-placement algorithms and cross-owner algorithms,
+while artifact validation prevents illegal local movement, duplicate blocks,
+missing cross owners, and permutation inconsistencies.
 
 ## One-time build
 

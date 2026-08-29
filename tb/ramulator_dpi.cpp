@@ -55,7 +55,7 @@ int8_t lookup_weight(unsigned row, unsigned column) {
     return it == weights.end() ? int8_t{0} : it->second;
 }
 
-void load_dataset(const std::string& path) {
+void load_dataset(const std::string& path, bool load_weights) {
     std::ifstream input(path);
     if (!input)
         throw std::runtime_error("cannot open dataset " + path);
@@ -66,6 +66,13 @@ void load_dataset(const std::string& path) {
         throw std::runtime_error("invalid dataset header in " + path);
     if (vertices != total_blocks * kSpinCount)
         throw std::runtime_error("dataset vertex count does not match RTL geometry");
+
+    // Timing-only simulations use exactly the same addresses and Ramulator
+    // command timing, but arithmetic payloads are discarded by the consumer.
+    // Avoid materializing millions of graph edges solely to return zero-valued
+    // data through the DPI bridge.
+    if (!load_weights)
+        return;
 
     unsigned source = 0;
     unsigned destination = 0;
@@ -100,17 +107,20 @@ void fill_data(uint64_t address, svBitVecVal* data) {
 
 }  // namespace
 
-extern "C" void az_dram_init(const char* config_path,
-                             const char* dataset_path,
-                             int system_count,
-                             int block_count) {
+void az_dram_init_common(const char* config_path,
+                         const char* dataset_path,
+                         int system_count,
+                         int block_count,
+                         bool timing_only) {
     if (!systems.empty())
         throw std::runtime_error("az_dram_init called twice");
     if (system_count <= 0 || block_count <= 0)
         throw std::runtime_error("invalid Ramulator system geometry");
 
     total_blocks = unsigned(block_count);
-    load_dataset(dataset_path);
+    memory_tick = 0;
+    weights.clear();
+    load_dataset(dataset_path, !timing_only);
     systems.resize(size_t(system_count));
 
     for (auto& system : systems) {
@@ -122,6 +132,22 @@ extern "C" void az_dram_init(const char* config_path,
         if (system.memory->get_tx_bytes() != int(kTransactionBytes))
             throw std::runtime_error("Ramulator GDDR transaction is not 32 bytes");
     }
+}
+
+extern "C" void az_dram_init(const char* config_path,
+                             const char* dataset_path,
+                             int system_count,
+                             int block_count) {
+    az_dram_init_common(
+        config_path, dataset_path, system_count, block_count, false);
+}
+
+extern "C" void az_dram_init_timing(const char* config_path,
+                                    const char* dataset_path,
+                                    int system_count,
+                                    int block_count) {
+    az_dram_init_common(
+        config_path, dataset_path, system_count, block_count, true);
 }
 
 extern "C" int az_dram_send(int system_id, uint64_t address, int tag) {
@@ -201,4 +227,6 @@ extern "C" void az_dram_finalize() {
         delete system.memory;
     }
     systems.clear();
+    weights.clear();
+    memory_tick = 0;
 }

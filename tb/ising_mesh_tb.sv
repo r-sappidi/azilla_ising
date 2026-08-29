@@ -202,7 +202,9 @@ module ising_mesh_tb #(
     string dataset_path;
     string schedule_path;
     string matlab_golden_path;
+    string state_dump_path;
     int matlab_golden_file;
+    int state_dump_file;
     int dataset_vertex_count;
     longint dataset_known_cut;
     longint dataset_edge_records;
@@ -1952,6 +1954,9 @@ module ising_mesh_tb #(
                            golden_next[spin]);
                 errors++;
             end
+            if (state_dump_file != 0)
+                $fdisplay(state_dump_file, "%0d %0d %0d", iteration, spin,
+                          state_next_o[node_id][h0_id][core_id][spin_id]);
         end
         if (errors != 0)
             $fatal(1, "iteration %0d failed with %0d state mismatches",
@@ -1981,6 +1986,13 @@ module ising_mesh_tb #(
         rst = 1'b1;
         load_dataset();
         matlab_golden_file = 0;
+        state_dump_file = 0;
+        if ($value$plusargs("DUMP_STATES=%s", state_dump_path)) begin
+            state_dump_file = $fopen(state_dump_path, "w");
+            if (state_dump_file == 0)
+                $fatal(1, "cannot create state dump file %s", state_dump_path);
+            $fdisplay(state_dump_file, "iteration spin state");
+        end
         if ($value$plusargs("MATLAB_GOLDEN=%s", matlab_golden_path)) begin
             matlab_golden_file = $fopen(matlab_golden_path, "r");
             if (matlab_golden_file == 0)
@@ -2105,6 +2117,8 @@ module ising_mesh_tb #(
         end
         if (matlab_golden_file != 0)
             $fclose(matlab_golden_file);
+        if (state_dump_file != 0)
+            $fclose(state_dump_file);
         $finish;
     end
 endmodule
