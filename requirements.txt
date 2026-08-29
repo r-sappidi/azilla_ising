@@ -1,3 +1,9 @@
-# Core cycle model, mapping-artifact interface, and unit tests.
+# Cycle model and mapping-artifact interface.
 numpy>=1.24,<3
 
+# Bundled graph mapper. For CUDA, install the appropriate PyTorch wheel from
+# https://pytorch.org/get-started/locally/ before installing this file.
+torch>=2.1
+
+# NoC plotting scripts.
+matplotlib>=3.7

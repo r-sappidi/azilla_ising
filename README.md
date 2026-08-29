@@ -50,22 +50,13 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` contains the small core dependency set. For the bundled
-mapping algorithm, install the appropriate PyTorch build for the machine first
-using the [official PyTorch selector](https://pytorch.org/get-started/locally/),
-then install the mapping requirements:
-
-```bash
-python -m pip install -r requirements-mapping.txt
-```
-
-A CUDA-enabled PyTorch build is strongly recommended for million-spin mapping.
-CPU PyTorch is sufficient for small tests and for consuming an artifact
-produced elsewhere. Plot generation is optional:
-
-```bash
-python -m pip install -r requirements-plotting.txt
-```
+The single `requirements.txt` installs NumPy, PyTorch, and Matplotlib for the
+complete Python toolset. A CUDA-enabled PyTorch build is strongly recommended
+for million-spin mapping. On a CUDA machine, use the
+[official PyTorch selector](https://pytorch.org/get-started/locally/) to install
+the appropriate wheel before running `pip install -r requirements.txt`; pip
+will retain that compatible installation. CPU PyTorch is sufficient for small
+tests and for consuming an artifact produced elsewhere.
 
 The Python package is currently used directly from the source tree, so prefix
 commands with `PYTHONPATH=model` rather than installing it into the environment.
@@ -158,4 +149,3 @@ which the same vertex permutation has been applied.
 - A pull is blocked by generated files: preserve real work with
   `git stash push -u`, remove regenerable caches, then retry the pull. Do not
   force-push or discard unreviewed RTL changes.
-
