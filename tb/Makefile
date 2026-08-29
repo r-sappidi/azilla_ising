@@ -18,6 +18,7 @@ MEM_PIN_GBPS ?= 32
 MEM_LANES ?= 16
 ITERATION_COUNT ?= 1
 TIMING_ONLY ?= 0
+REGENERATE_RAMULATOR_CONFIG ?= 0
 COEFF_A_VALUE ?= 0
 COEFF_B_VALUE ?= 1
 NOISE_AMPLITUDE ?= 0
@@ -43,7 +44,7 @@ FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
 
-.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
+.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test ramulator-config dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
 
 cycle-model-compute-trace-build:
 	mkdir -p ../build/cycle_model_compute_trace_tb
@@ -250,11 +251,18 @@ floo-mesh-test:
 	cd .. && build/$(notdir $(FLOO_BUILD_DIR))/Vising_mesh_tb \
 		+DATASET=$(DATASET) +NOC_STATS_FILE=$(NOC_STATS_FILE) $(SIM_ARGS)
 
-# Full hierarchy with node-local Ramulator-backed projected GDDR interfaces.
-floo-mesh-dram-test:
+# Regenerate the checked-in projected-memory configuration only when changing
+# its physical pin/rate parameters. This target requires Ramulator's optional
+# Python bindings; ordinary simulations consume the checked-in YAML directly.
+ramulator-config:
 	AZILLA_MEM_PINS=$(MEM_PIN_COUNT) AZILLA_MEM_PIN_GBPS=$(MEM_PIN_GBPS) \
 		PYTHONPATH=$(abspath $(RAMULATOR_DIR))/python \
 		python3 -m ramulator export ramulator_config.py -o ramulator_128x32.yaml
+
+RAMULATOR_CONFIG_PREREQ := $(if $(filter 1,$(REGENERATE_RAMULATOR_CONFIG)),ramulator-config,)
+
+# Full hierarchy with node-local Ramulator-backed projected GDDR interfaces.
+floo-mesh-dram-test: $(RAMULATOR_CONFIG_PREREQ)
 	$(MAKE) floo-mesh-test USE_RAMULATOR=1
 
 clean:

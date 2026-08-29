@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Install the correct CPU or CUDA wheel from https://pytorch.org/get-started/locally/
+# before using this file on a mapping machine.
+torch>=2.1
+

@@ -1,0 +1,3 @@
+# Core cycle model, mapping-artifact interface, and unit tests.
+numpy>=1.24,<3
+

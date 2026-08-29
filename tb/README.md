@@ -90,9 +90,15 @@ Build Ramulator 2.1 once before running the memory-timed tests:
 
 ```bash
 cmake -S third_party/ramulator2 -B third_party/ramulator2/build \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DRAMULATOR_PYTHON_BINDINGS=OFF
 cmake --build third_party/ramulator2/build -j
 ```
+
+The checked-in `tb/ramulator_128x32.yaml` is sufficient for the timing tests.
+Building with Python bindings disabled avoids regenerating source files inside
+the Ramulator submodule. Enable the bindings only when intentionally
+regenerating the YAML through `tb/ramulator_config.py`.
 
 Run the standalone tagged weight-streamer check with:
 
@@ -106,6 +112,10 @@ H1, and cross-H1 compute node with:
 ```bash
 make -C tb floo-mesh-dram-test DATASET=g256_smoke.txt
 ```
+
+This uses the checked-in `ramulator_128x32.yaml`. When intentionally changing
+`MEM_PIN_COUNT` or `MEM_PIN_GBPS`, build/install Ramulator's optional Python
+bindings and add `REGENERATE_RAMULATOR_CONFIG=1` to regenerate the YAML.
 
 In Ramulator mode, the testbench compiles the selected dense or sparse block
 set into per-node descriptor queues. A ready-aware round-robin dispatcher at
