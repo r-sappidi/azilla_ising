@@ -182,6 +182,14 @@ module spin_core (
                 lfsr_state <= noise_seed;
             end
 
+            // Coefficients may be annealed by the controller. Sample them at
+            // the iteration boundary so they remain stable while partials are
+            // accumulated and the final field is evaluated.
+            if ((core_state == CORE_IDLE) && iter_start) begin
+                coeff_a_reg <= coeff_a;
+                coeff_b_reg <= coeff_b;
+            end
+
             if ((core_state == CORE_INIT) &&
                 weight_init_valid && weight_init_ready) begin
                 weight_beat_count <= weight_beat_count + 1'b1;

@@ -82,25 +82,59 @@ document's hybrid replay or the exact arithmetic/Ramulator model. Exact
 functional runs must use the emitted permuted dataset with that schedule.
 Using mapped block coordinates with the original vertex numbering is invalid.
 
-The artifact-direct exact command is:
+The artifact-direct exact timing command is:
 
 ```bash
-PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-mapped-ramulator \
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-mapped-exact-events \
   --artifact mappings/g16384 \
   --dataset mappings/g16384/dataset.txt \
+  --h0-mvms 1 --h1-mvms 1 --cross-mvms 16 \
   --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
-  --ramulator-config tb/ramulator_128x32.yaml
+  --ramulator-config tb/ramulator_128x32.yaml \
+  --idle-refresh-period-ticks 7600 \
+  --metrics-prefix results/g16384/my_mapper \
+  --transfer-trace results/g16384/my_mapper_transfers.csv
 ```
 
-This uses live Ramulator2 timing rather than the event model's fixed endpoint
-profile. It is cycle-stepped and intended as the exact validation/calibration
-path for selected mapping points.
+This uses live Ramulator2 timing rather than the older event model's fixed
+endpoint profile. It steps every active memory, hierarchy, and network cycle
+and is intended for final mapping comparisons. The optional metrics prefix
+produces:
+
+```text
+<prefix>_summary.json   complete machine-readable result and hop histogram
+<prefix>_noc.csv        per-endpoint and per-directed-link traffic/stalls
+<prefix>_nodes.csv      per-H1 work allocation and completion timing
+<prefix>_dram.csv       per-memory-system requests, retries, and latency
+```
+
+`--transfer-trace` additionally writes every accepted injection, physical hop,
+and ejection with its cycle and packet metadata. The NoC CSV includes offered
+cycles, accepted flits, stalls, completed packets, packet-type counts,
+utilization, and backpressure. The node CSV separates H0, H1, and cross-H1
+jobs, state-publication load, and completion cycles. The DRAM CSV identifies
+each hierarchy endpoint and reports accepted/rejected/completed requests,
+outstanding requests, and average/maximum latency in ticks and accelerator
+cycles.
+
+The exporter checks that per-resource accepted/stall sums equal the global NoC
+counters, that the hop histogram reproduces physical-link traffic, and that
+each DRAM system completes exactly 32 reads per scheduled block before writing
+the files.
 
 Alternative algorithms should call
 `artifact_from_mapping(..., owner_assigner=...)`. This provides one stable
 test interface for vertex-placement algorithms and cross-owner algorithms,
 while artifact validation prevents illegal local movement, duplicate blocks,
 missing cross owners, and permutation inconsistencies.
+
+For a packaged implementation, pass
+`--chiplet-link-latency-cycles N` to either event simulator. This models a
+fully-pipelined, fixed-latency crossing inside each H1 package for H0 state
+publication/snapshot traffic and H1/cross partial return traffic. Keep this
+parameter separate from the `--link-*` options, which describe physical links
+between H1 packages. Nonzero values are projections rather than RTL-certified
+timing, and are recorded in the exact-event summary JSON.
 
 ## One-time build
 
@@ -315,6 +349,19 @@ Useful comparison metrics are:
 - peak in-flight flits;
 - traffic balance across nodes and directed links;
 - replay completion cycle under the same endpoint timing assumptions.
+
+For exact-event mapping runs, also compare per-node H0/H1/cross work balance,
+the flit-hop histogram, the most backpressured directed links, memory request
+rejection rate, and memory-latency imbalance. These distinguish a mapping that
+reduces communication from one that merely moves the critical bottleneck to a
+different node or memory interface.
+
+Finalists should also be swept across `--link-latency-cycles`,
+`--link-flit-interval-cycles`, `--link-max-inflight-flits`, and
+`--link-credit-return-cycles`. These respectively expose sensitivity to
+per-hop delay, serialization bandwidth, the finite in-flight credit window,
+and delayed backpressure. Non-default runs are physical-link projections; the
+zero-additional-latency defaults retain the RTL differential baseline.
 
 Do not compare only total injected flits. Two mappings can inject the same
 number of partials while producing very different hop counts and hotspots.

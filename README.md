@@ -122,7 +122,32 @@ format, built-in and external mapping interfaces, validation, fast screening,
 and exact-event performance testing. A typical experiment creates a mapping
 artifact and consistently permuted dataset, validates their schedule, screens
 many candidates with `simulate-mapped-events`, and runs finalists with
-`simulate-mapped-exact-events`.
+`simulate-mapped-exact-events`. Add `--metrics-prefix results/<run>` to export
+summary JSON plus per-link NoC, per-node workload, and per-memory-system DRAM
+tables; add `--transfer-trace results/<run>_transfers.csv` for the full accepted
+flit trace.
+
+## Paper benchmark campaign
+
+See [BENCHMARK_CAMPAIGN.md](BENCHMARK_CAMPAIGN.md) for the primary-source
+benchmark rationale, reproducible Gset and scalable sparse dataset preparation,
+calibrated and Ramulator exact-event sweeps, mapping/owner comparisons,
+interconnect sensitivity, complete counter schemas, link-utilization heatmaps,
+and paper-table generation. Raw downloads and run products stay under the
+Git-ignored `results/paper_benchmarks/` tree; the scripts and methodology are
+tracked.
+
+## CIR ablation
+
+See [docs/CIR_BASELINE.md](docs/CIR_BASELINE.md) for the frozen
+destination-stationary cores-only baseline, comparison controls, required
+metrics, and fidelity limits. The baseline is selected explicitly with
+`--execution-mode cores-only`; CIR remains the default as
+`--execution-mode cir`. Both calibrated `simulate-events` and live-Ramulator
+`simulate-exact-events` accept the option, as do their mapped counterparts.
+See [model/README.md](model/README.md#cir-and-cores-only-execution-modes) for
+side-by-side commands and accuracy limitations. Cores-only exact-event and RTL
+results must not be inferred from the calibrated screening path.
 
 ## RTL workflows and generated files
 

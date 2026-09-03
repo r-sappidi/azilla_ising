@@ -203,6 +203,11 @@ module ising_mesh_tb #(
     string schedule_path;
     string matlab_golden_path;
     string state_dump_path;
+    string solver_schedule_path;
+    int runtime_iteration_count;
+    int solver_coeff_a [0:ITERATION_COUNT-1];
+    int solver_coeff_b [0:ITERATION_COUNT-1];
+    int solver_noise [0:ITERATION_COUNT-1];
     int matlab_golden_file;
     int state_dump_file;
     int dataset_vertex_count;
@@ -282,6 +287,28 @@ module ising_mesh_tb #(
     bit noc_inject_stall_active [0:NODE_COUNT-1];
     bit noc_eject_stall_active [0:NODE_COUNT-1];
     bit noc_link_stall_active [0:NODE_COUNT-1][0:3];
+
+    // Internal hierarchy instrumentation. Endpoint indices [0,H0_COUNT)
+    // identify H0 tiles, H0_COUNT identifies the H1-local compute node, and
+    // H0_COUNT+1 identifies the cross-H1 compute node. Transfer indices are
+    // command, weight, state-table load, and partial-result respectively.
+    localparam int INTERNAL_ENDPOINT_COUNT = H0_COUNT + 2;
+    localparam int INTERNAL_TRANSFER_COUNT = 4;
+    localparam int INTERNAL_CMD = 0;
+    localparam int INTERNAL_WEIGHT = 1;
+    localparam int INTERNAL_STATE = 2;
+    localparam int INTERNAL_PARTIAL = 3;
+    longint unsigned internal_offered
+        [0:NODE_COUNT-1][0:INTERNAL_ENDPOINT_COUNT-1][0:INTERNAL_TRANSFER_COUNT-1];
+    longint unsigned internal_accepted
+        [0:NODE_COUNT-1][0:INTERNAL_ENDPOINT_COUNT-1][0:INTERNAL_TRANSFER_COUNT-1];
+    longint unsigned internal_stalled
+        [0:NODE_COUNT-1][0:INTERNAL_ENDPOINT_COUNT-1][0:INTERNAL_TRANSFER_COUNT-1];
+    longint unsigned internal_first_accept
+        [0:NODE_COUNT-1][0:INTERNAL_ENDPOINT_COUNT-1][0:INTERNAL_TRANSFER_COUNT-1];
+    longint unsigned internal_last_accept
+        [0:NODE_COUNT-1][0:INTERNAL_ENDPOINT_COUNT-1][0:INTERNAL_TRANSFER_COUNT-1];
+    int internal_event_file;
     logic [NODE_COUNT-1:0][H0_COUNT-1:0][H0_MVM_COUNT-1:0]
         h0_cmd_accepted;
     logic [NODE_COUNT-1:0][H1_MVM_COUNT-1:0] h1_cmd_accepted;
@@ -639,8 +666,10 @@ module ising_mesh_tb #(
     initial begin : configure_noc_temporal_trace
         string timeline_path;
         string event_path;
+        string internal_event_path;
         noc_timeline_file = 0;
         noc_event_file = 0;
+        internal_event_file = 0;
         noc_stats_interval = 100;
         noc_trace_start = 0;
         noc_trace_end = 64'h7fff_ffff_ffff_ffff;
@@ -664,6 +693,14 @@ module ising_mesh_tb #(
                 $fatal(1, "could not open NoC event file %s", event_path);
             $fdisplay(noc_event_file,
                 "cycle,event,scope,node,x,y,direction,packet_type,source_id,epoch,block_id,dest_x,dest_y,last,valid,ready,inflight");
+        end
+        if ($value$plusargs("INTERNAL_EVENT_FILE=%s", internal_event_path)) begin
+            internal_event_file = $fopen(internal_event_path, "w");
+            if (internal_event_file == 0)
+                $fatal(1, "could not open internal event file %s",
+                       internal_event_path);
+            $fdisplay(internal_event_file,
+                "cycle,event,node,endpoint_class,endpoint_id,transfer,accepted_lanes");
         end
     end
 
@@ -945,6 +982,11 @@ module ising_mesh_tb #(
     endfunction
 
     task automatic validate_configuration;
+        if (runtime_iteration_count <= 0 ||
+            runtime_iteration_count > ITERATION_COUNT)
+            $fatal(1,
+                   "runtime iteration count must be between 1 and compiled maximum %0d (got %0d)",
+                   ITERATION_COUNT, runtime_iteration_count);
         if (!is_power_of_two(MESH_X_COUNT) || !is_power_of_two(MESH_Y_COUNT))
             $fatal(1, "mesh dimensions must each be powers of two");
         if (!is_power_of_two(H0_COUNT))
@@ -1711,6 +1753,325 @@ module ising_mesh_tb #(
                   &cross_streamer_idle);
     endtask
 
+    function automatic string internal_transfer_name(input int transfer);
+        case (transfer)
+            INTERNAL_CMD: return "command";
+            INTERNAL_WEIGHT: return "weight";
+            INTERNAL_STATE: return "state_load";
+            default: return "partial";
+        endcase
+    endfunction
+
+    task automatic write_internal_accept_event(
+        input int node,
+        input string endpoint_class,
+        input int endpoint_id,
+        input int transfer,
+        input int accepted_lanes
+    );
+        if (internal_event_file != 0 && accepted_lanes != 0)
+            $fdisplay(internal_event_file, "%0d,accept,%0d,%s,%0d,%s,%0d",
+                cycle_count, node, endpoint_class, endpoint_id,
+                internal_transfer_name(transfer), accepted_lanes);
+    endtask
+
+    // Observe existing ready/valid boundaries without adding ports or state to
+    // synthesizable RTL. Counts are lane-transfers: if two engines handshake
+    // in one cycle, two transfers are recorded.
+    generate
+        for (genvar internal_node = 0; internal_node < NODE_COUNT;
+             internal_node++) begin : monitor_internal_node
+            localparam int IX = internal_node % MESH_X_COUNT;
+            localparam int IY = internal_node / MESH_X_COUNT;
+            for (genvar internal_h0 = 0; internal_h0 < H0_COUNT;
+                 internal_h0++) begin : monitor_internal_h0
+                always @(posedge clk) begin : collect_h0_internal
+                    int offered_count;
+                    int accepted_count;
+                    int endpoint;
+                    endpoint = internal_h0;
+                    if (rst) begin
+                        for (int transfer = 0; transfer < INTERNAL_TRANSFER_COUNT;
+                             transfer++) begin
+                            internal_offered[internal_node][endpoint][transfer] <= 0;
+                            internal_accepted[internal_node][endpoint][transfer] <= 0;
+                            internal_stalled[internal_node][endpoint][transfer] <= 0;
+                            internal_first_accept[internal_node][endpoint][transfer] <= 0;
+                            internal_last_accept[internal_node][endpoint][transfer] <= 0;
+                        end
+                    end
+                    else if (noc_stats_active) begin
+                        offered_count = $countones(
+                            h0_dma_cmd_valid_i[internal_node][internal_h0]);
+                        accepted_count = $countones(
+                            h0_dma_cmd_valid_i[internal_node][internal_h0] &
+                            h0_dma_cmd_ready_o[internal_node][internal_h0]);
+                        write_internal_accept_event(internal_node, "h0", internal_h0,
+                            INTERNAL_CMD, accepted_count);
+                        internal_offered[internal_node][endpoint][INTERNAL_CMD] += offered_count;
+                        internal_accepted[internal_node][endpoint][INTERNAL_CMD] += accepted_count;
+                        internal_stalled[internal_node][endpoint][INTERNAL_CMD] +=
+                            offered_count - accepted_count;
+                        if (accepted_count != 0) begin
+                            if (internal_first_accept[internal_node][endpoint][INTERNAL_CMD] == 0)
+                                internal_first_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                            internal_last_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                        end
+
+                        offered_count = $countones(
+                            h0_dma_weight_valid_i[internal_node][internal_h0]);
+                        accepted_count = $countones(
+                            h0_dma_weight_valid_i[internal_node][internal_h0] &
+                            h0_dma_weight_ready_o[internal_node][internal_h0]);
+                        write_internal_accept_event(internal_node, "h0", internal_h0,
+                            INTERNAL_WEIGHT, accepted_count);
+                        internal_offered[internal_node][endpoint][INTERNAL_WEIGHT] += offered_count;
+                        internal_accepted[internal_node][endpoint][INTERNAL_WEIGHT] += accepted_count;
+                        internal_stalled[internal_node][endpoint][INTERNAL_WEIGHT] +=
+                            offered_count - accepted_count;
+                        if (accepted_count != 0) begin
+                            if (internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] == 0)
+                                internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                            internal_last_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                        end
+
+                        offered_count = dut.gen_y[IY].gen_x[IX].tile.h1.
+                            gen_h0_tiles[internal_h0].child_h0.node_state_valid;
+                        accepted_count = offered_count &&
+                            dut.gen_y[IY].gen_x[IX].tile.h1.
+                            gen_h0_tiles[internal_h0].child_h0.node_state_ready;
+                        write_internal_accept_event(internal_node, "h0", internal_h0,
+                            INTERNAL_STATE, accepted_count);
+                        internal_offered[internal_node][endpoint][INTERNAL_STATE] += offered_count;
+                        internal_accepted[internal_node][endpoint][INTERNAL_STATE] += accepted_count;
+                        internal_stalled[internal_node][endpoint][INTERNAL_STATE] +=
+                            offered_count - accepted_count;
+                        if (accepted_count != 0) begin
+                            if (internal_first_accept[internal_node][endpoint][INTERNAL_STATE] == 0)
+                                internal_first_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                            internal_last_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                        end
+
+                        offered_count = $countones(dut.gen_y[IY].gen_x[IX].tile.h1.
+                            gen_h0_tiles[internal_h0].child_h0.node_partial_valid);
+                        accepted_count = $countones(dut.gen_y[IY].gen_x[IX].tile.h1.
+                            gen_h0_tiles[internal_h0].child_h0.node_partial_valid &
+                            dut.gen_y[IY].gen_x[IX].tile.h1.
+                            gen_h0_tiles[internal_h0].child_h0.node_partial_ready);
+                        write_internal_accept_event(internal_node, "h0", internal_h0,
+                            INTERNAL_PARTIAL, accepted_count);
+                        internal_offered[internal_node][endpoint][INTERNAL_PARTIAL] += offered_count;
+                        internal_accepted[internal_node][endpoint][INTERNAL_PARTIAL] += accepted_count;
+                        internal_stalled[internal_node][endpoint][INTERNAL_PARTIAL] +=
+                            offered_count - accepted_count;
+                        if (accepted_count != 0) begin
+                            if (internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] == 0)
+                                internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                            internal_last_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                        end
+                    end
+                end
+            end
+
+            always @(posedge clk) begin : collect_h1_cross_internal
+                int offered_count;
+                int accepted_count;
+                int endpoint;
+                if (rst) begin
+                    for (int hierarchy = 0; hierarchy < 2; hierarchy++) begin
+                        endpoint = H0_COUNT + hierarchy;
+                        for (int transfer = 0; transfer < INTERNAL_TRANSFER_COUNT;
+                             transfer++) begin
+                            internal_offered[internal_node][endpoint][transfer] <= 0;
+                            internal_accepted[internal_node][endpoint][transfer] <= 0;
+                            internal_stalled[internal_node][endpoint][transfer] <= 0;
+                            internal_first_accept[internal_node][endpoint][transfer] <= 0;
+                            internal_last_accept[internal_node][endpoint][transfer] <= 0;
+                        end
+                    end
+                end
+                else if (noc_stats_active) begin
+                    endpoint = H0_COUNT;
+                    offered_count = $countones(h1_dma_cmd_valid_i[internal_node]);
+                    accepted_count = $countones(h1_dma_cmd_valid_i[internal_node] &
+                                                h1_dma_cmd_ready_o[internal_node]);
+                    write_internal_accept_event(internal_node, "h1", 0,
+                        INTERNAL_CMD, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_CMD] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_CMD] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_CMD] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_CMD] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                    end
+                    offered_count = $countones(h1_dma_weight_valid_i[internal_node]);
+                    accepted_count = $countones(h1_dma_weight_valid_i[internal_node] &
+                                                h1_dma_weight_ready_o[internal_node]);
+                    write_internal_accept_event(internal_node, "h1", 0,
+                        INTERNAL_WEIGHT, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_WEIGHT] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_WEIGHT] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_WEIGHT] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                    end
+                    offered_count = dut.gen_y[IY].gen_x[IX].tile.h1.h1_node_state_valid;
+                    accepted_count = offered_count &&
+                        dut.gen_y[IY].gen_x[IX].tile.h1.h1_node_state_ready;
+                    write_internal_accept_event(internal_node, "h1", 0,
+                        INTERNAL_STATE, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_STATE] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_STATE] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_STATE] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_STATE] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                    end
+                    offered_count = $countones(
+                        dut.gen_y[IY].gen_x[IX].tile.h1.node_partial_valid);
+                    accepted_count = $countones(
+                        dut.gen_y[IY].gen_x[IX].tile.h1.node_partial_valid &
+                        dut.gen_y[IY].gen_x[IX].tile.h1.node_partial_ready);
+                    write_internal_accept_event(internal_node, "h1", 0,
+                        INTERNAL_PARTIAL, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_PARTIAL] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_PARTIAL] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_PARTIAL] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                    end
+
+                    endpoint = H0_COUNT + 1;
+                    offered_count = $countones(cross_dma_cmd_valid_i[internal_node]);
+                    accepted_count = $countones(cross_dma_cmd_valid_i[internal_node] &
+                                                cross_dma_cmd_ready_o[internal_node]);
+                    write_internal_accept_event(internal_node, "cross", 0,
+                        INTERNAL_CMD, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_CMD] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_CMD] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_CMD] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_CMD] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_CMD] <= cycle_count;
+                    end
+                    offered_count = $countones(cross_dma_weight_valid_i[internal_node]);
+                    accepted_count = $countones(cross_dma_weight_valid_i[internal_node] &
+                                                cross_dma_weight_ready_o[internal_node]);
+                    write_internal_accept_event(internal_node, "cross", 0,
+                        INTERNAL_WEIGHT, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_WEIGHT] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_WEIGHT] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_WEIGHT] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_WEIGHT] <= cycle_count;
+                    end
+                    offered_count = dut.gen_y[IY].gen_x[IX].tile.top.cross_compute.
+                        hierarchy_state_valid;
+                    accepted_count = offered_count && dut.gen_y[IY].gen_x[IX].tile.
+                        top.cross_compute.hierarchy_state_ready;
+                    write_internal_accept_event(internal_node, "cross", 0,
+                        INTERNAL_STATE, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_STATE] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_STATE] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_STATE] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_STATE] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_STATE] <= cycle_count;
+                    end
+                    offered_count = $countones(dut.gen_y[IY].gen_x[IX].tile.top.
+                        cross_compute.partial_valid);
+                    accepted_count = $countones(dut.gen_y[IY].gen_x[IX].tile.top.
+                        cross_compute.partial_valid & dut.gen_y[IY].gen_x[IX].tile.
+                        top.cross_compute.partial_ready);
+                    write_internal_accept_event(internal_node, "cross", 0,
+                        INTERNAL_PARTIAL, accepted_count);
+                    internal_offered[internal_node][endpoint][INTERNAL_PARTIAL] += offered_count;
+                    internal_accepted[internal_node][endpoint][INTERNAL_PARTIAL] += accepted_count;
+                    internal_stalled[internal_node][endpoint][INTERNAL_PARTIAL] += offered_count-accepted_count;
+                    if (accepted_count != 0) begin
+                        if (internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] == 0)
+                            internal_first_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                        internal_last_accept[internal_node][endpoint][INTERNAL_PARTIAL] <= cycle_count;
+                    end
+                end
+            end
+        end
+    endgenerate
+
+    task automatic report_internal_statistics;
+        string stats_path;
+        int stats_file;
+        string endpoint_class;
+        int endpoint_id;
+        int lane_count;
+        real utilization;
+        real pressure;
+        if (!$value$plusargs("INTERNAL_STATS_FILE=%s", stats_path))
+            stats_path = "internal_stats.csv";
+        stats_file = $fopen(stats_path, "w");
+        if (stats_file == 0)
+            $fatal(1, "could not open internal statistics file %s", stats_path);
+        $fdisplay(stats_file,
+            "node,x,y,endpoint_class,endpoint_id,transfer,offered_lane_cycles,accepted_transfers,stalled_lane_cycles,first_accept_cycle,last_accept_cycle,capacity_utilization,backpressure_fraction");
+        for (int node = 0; node < NODE_COUNT; node++) begin
+            for (int endpoint = 0; endpoint < INTERNAL_ENDPOINT_COUNT; endpoint++) begin
+                if (endpoint < H0_COUNT) begin
+                    endpoint_class = "h0";
+                    endpoint_id = endpoint;
+                end
+                else if (endpoint == H0_COUNT) begin
+                    endpoint_class = "h1";
+                    endpoint_id = 0;
+                end
+                else begin
+                    endpoint_class = "cross";
+                    endpoint_id = 0;
+                end
+                for (int transfer = 0; transfer < INTERNAL_TRANSFER_COUNT;
+                     transfer++) begin
+                    if (transfer == INTERNAL_STATE)
+                        lane_count = 1;
+                    else if (endpoint < H0_COUNT)
+                        lane_count = H0_MVM_COUNT;
+                    else if (endpoint == H0_COUNT)
+                        lane_count = H1_MVM_COUNT;
+                    else
+                        lane_count = CROSS_MVM_COUNT;
+                    utilization = noc_monitor_cycles == 0 ? 0.0 :
+                        real'(internal_accepted[node][endpoint][transfer]) /
+                        real'(noc_monitor_cycles * lane_count);
+                    pressure = internal_offered[node][endpoint][transfer] == 0 ? 0.0 :
+                        real'(internal_stalled[node][endpoint][transfer]) /
+                        real'(internal_offered[node][endpoint][transfer]);
+                    $fdisplay(stats_file,
+                        "%0d,%0d,%0d,%s,%0d,%s,%0d,%0d,%0d,%0d,%0d,%0.6f,%0.6f",
+                        node, node % MESH_X_COUNT, node / MESH_X_COUNT,
+                        endpoint_class, endpoint_id, internal_transfer_name(transfer),
+                        internal_offered[node][endpoint][transfer],
+                        internal_accepted[node][endpoint][transfer],
+                        internal_stalled[node][endpoint][transfer],
+                        internal_first_accept[node][endpoint][transfer],
+                        internal_last_accept[node][endpoint][transfer], utilization,
+                        pressure);
+                end
+            end
+        end
+        $fclose(stats_file);
+        $display("Internal hierarchy detailed CSV: %s", stats_path);
+    endtask
+
+    logic [NODE_COUNT-1:0] router_activity;
+
     // A packet buffered anywhere in a Floo router produces an output request.
     // Four consecutive globally quiet cycles therefore provide a testbench
     // drain barrier without adding debug ports to the synthesizable RTL.
@@ -1856,7 +2217,6 @@ module ising_mesh_tb #(
         $display("NOC detailed CSV: %s", stats_path);
     endtask
 
-    logic [NODE_COUNT-1:0] router_activity;
     for (genvar y = 0; y < MESH_Y_COUNT; y++) begin : monitor_y
         for (genvar x = 0; x < MESH_X_COUNT; x++) begin : monitor_x
             localparam int N = y*MESH_X_COUNT + x;
@@ -1910,9 +2270,11 @@ module ising_mesh_tb #(
             block_id = spin / SPIN_COUNT;
             local_spin = spin % SPIN_COUNT;
             noise = golden_lfsr[block_id][local_spin] ?
-                    NOISE_AMPLITUDE : -NOISE_AMPLITUDE;
-            field = (current_spin(spin) ? COEFF_A_VALUE : -COEFF_A_VALUE) +
-                    COEFF_B_VALUE * golden_sum[spin] + noise;
+                    $signed(noise_amplitude_i[0]) :
+                    -$signed(noise_amplitude_i[0]);
+            field = (current_spin(spin) ? $signed(coeff_a_i[0]) :
+                                          -$signed(coeff_a_i[0])) +
+                    $signed(coeff_b_i[0]) * golden_sum[spin] + noise;
             golden_next[spin] = field >= 0;
         end
     endtask
@@ -1973,7 +2335,35 @@ module ising_mesh_tb #(
         int matlab_spin_count;
         int matlab_iteration_count;
         int matlab_header_result;
+        int runtime_iteration_scan;
+        int solver_schedule_file;
+        int solver_schedule_scan;
 
+        runtime_iteration_count = ITERATION_COUNT;
+        runtime_iteration_scan =
+            $value$plusargs("ITERATIONS=%d", runtime_iteration_count);
+        for (int iteration = 0; iteration < ITERATION_COUNT; iteration++) begin
+            solver_coeff_a[iteration] = COEFF_A_VALUE;
+            solver_coeff_b[iteration] = COEFF_B_VALUE;
+            solver_noise[iteration] = NOISE_AMPLITUDE;
+        end
+        if ($value$plusargs("SOLVER_SCHEDULE=%s", solver_schedule_path)) begin
+            solver_schedule_file = $fopen(solver_schedule_path, "r");
+            if (solver_schedule_file == 0)
+                $fatal(1, "cannot open solver schedule %s", solver_schedule_path);
+            for (int iteration = 0; iteration < runtime_iteration_count;
+                 iteration++) begin
+                solver_schedule_scan = $fscanf(
+                    solver_schedule_file, "%d %d %d\n",
+                    solver_coeff_a[iteration], solver_coeff_b[iteration],
+                    solver_noise[iteration]);
+                if (solver_schedule_scan != 3)
+                    $fatal(1, "solver schedule %s is missing iteration %0d",
+                           solver_schedule_path, iteration);
+            end
+            $fclose(solver_schedule_file);
+            $display("using solver schedule %s", solver_schedule_path);
+        end
         if (RAMULATOR_TCK_PS <= 0)
             $fatal(1, "RAMULATOR_TCK_PS must be positive");
         if ((CLK_PERIOD_PS % SAFE_RAMULATOR_TCK_PS) != 0)
@@ -2002,10 +2392,10 @@ module ising_mesh_tb #(
                                             matlab_iteration_count);
             if (matlab_header_result != 2 ||
                 matlab_spin_count != TOTAL_SPIN_COUNT ||
-                matlab_iteration_count != ITERATION_COUNT)
+                matlab_iteration_count != runtime_iteration_count)
                 $fatal(1, "MATLAB golden header mismatch: got spins=%0d iterations=%0d, expected spins=%0d iterations=%0d",
                        matlab_spin_count, matlab_iteration_count,
-                       TOTAL_SPIN_COUNT, ITERATION_COUNT);
+                       TOTAL_SPIN_COUNT, runtime_iteration_count);
             $display("using MATLAB golden states from %s", matlab_golden_path);
         end
         if (USE_RAMULATOR)
@@ -2043,7 +2433,7 @@ module ising_mesh_tb #(
         wait (&init_done_o);
         $display("initialization complete at cycle %0d", cycle_count);
 
-        for (int iteration = 0; iteration < ITERATION_COUNT; iteration++) begin
+        for (int iteration = 0; iteration < runtime_iteration_count; iteration++) begin
             issued_h0_blocks = 0;
             issued_h1_blocks = 0;
             issued_cross_blocks = 0;
@@ -2052,6 +2442,9 @@ module ising_mesh_tb #(
             h1_next_engine = '{default: 0};
             cross_next_engine = '{default: 0};
             epoch_i = '{default: EPOCH_W'(iteration)};
+            coeff_a_i = '{default: COEFF_W'(solver_coeff_a[iteration])};
+            coeff_b_i = '{default: COEFF_W'(solver_coeff_b[iteration])};
+            noise_amplitude_i = '{default: COEFF_W'(solver_noise[iteration])};
             compute_golden();
 
             @(negedge clk);
@@ -2087,10 +2480,9 @@ module ising_mesh_tb #(
             wait_for_network_drain();
             publish_completion();
             wait (&iter_done_o);
-            check_next_state(iteration);
-
             @(negedge clk);
-            if (iteration == ITERATION_COUNT-1)
+            check_next_state(iteration);
+            if (iteration == runtime_iteration_count-1)
                 done_i = '1;
             commit_i = '1;
             @(negedge clk);
@@ -2104,13 +2496,16 @@ module ising_mesh_tb #(
         end
 
         $display("PASS: %0d iteration(s), skip_zero_blocks=%0b, total_cycles=%0d",
-                 ITERATION_COUNT, SKIP_ZERO_BLOCKS, cycle_count);
+                 runtime_iteration_count, SKIP_ZERO_BLOCKS, cycle_count);
         write_noc_timeline_snapshot(cycle_count);
         report_noc_statistics();
+        report_internal_statistics();
         if (noc_timeline_file != 0)
             $fclose(noc_timeline_file);
         if (noc_event_file != 0)
             $fclose(noc_event_file);
+        if (internal_event_file != 0)
+            $fclose(internal_event_file);
         if (USE_RAMULATOR) begin
             az_dram_report();
             az_dram_finalize();

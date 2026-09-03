@@ -1,6 +1,8 @@
 import unittest
 
-from azilla_cycle_model.noc import EAST, LOCAL, WEST, Flit, FlooRouter, Mesh
+from azilla_cycle_model.noc import (
+    EAST, LOCAL, WEST, Flit, FlooRouter, InterconnectConfig, Mesh,
+)
 
 
 class RouterTests(unittest.TestCase):
@@ -75,6 +77,92 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(ejected[2].data, 99)
                 break
         self.assertEqual(delivered_cycle, 3)
+
+    def test_forward_latency_is_paid_per_hop(self):
+        mesh = Mesh(
+            3, 1, fifo_depth=4,
+            interconnect=InterconnectConfig(
+                forward_latency_cycles=3,
+                max_inflight_flits=8,
+            ),
+        )
+        flit = Flit(data=99, dest_x=2, dest_y=0)
+        held = flit
+        delivered_cycle = None
+        for cycle in range(20):
+            ready, ejected = mesh.tick({0: held} if held else {})
+            if held and ready[0]:
+                held = None
+            if 2 in ejected:
+                delivered_cycle = cycle
+                break
+        # The direct RTL mesh delivers at cycle 3. Three additional cycles
+        # on each of two physical links move delivery to cycle 9.
+        self.assertEqual(delivered_cycle, 9)
+
+    def test_flit_interval_limits_sustained_bandwidth(self):
+        mesh = Mesh(
+            2, 1, fifo_depth=4,
+            interconnect=InterconnectConfig(
+                flit_interval_cycles=3,
+                max_inflight_flits=8,
+            ),
+        )
+        pending = [Flit(data=index, dest_x=1, dest_y=0) for index in range(4)]
+        delivered = []
+        for cycle in range(20):
+            ready, ejected = mesh.tick({0: pending[0]} if pending else {})
+            if pending and ready[0]:
+                pending.pop(0)
+            if 1 in ejected:
+                delivered.append((cycle, ejected[1].data))
+            if len(delivered) == 4:
+                break
+        self.assertEqual(delivered, [(2, 0), (5, 1), (8, 2), (11, 3)])
+
+    def test_credit_window_and_return_delay_throttle_link(self):
+        mesh = Mesh(
+            2, 1, fifo_depth=4,
+            interconnect=InterconnectConfig(
+                forward_latency_cycles=2,
+                max_inflight_flits=1,
+                credit_return_latency_cycles=2,
+            ),
+        )
+        pending = [Flit(data=index, dest_x=1, dest_y=0) for index in range(4)]
+        delivered = []
+        for cycle in range(30):
+            ready, ejected = mesh.tick({0: pending[0]} if pending else {})
+            if pending and ready[0]:
+                pending.pop(0)
+            if 1 in ejected:
+                delivered.append((cycle, ejected[1].data))
+            if len(delivered) == 4:
+                break
+        self.assertEqual(delivered, [(4, 0), (9, 1), (14, 2), (19, 3)])
+
+    def test_receive_backpressure_preserves_order_and_data(self):
+        mesh = Mesh(
+            2, 1, fifo_depth=2,
+            interconnect=InterconnectConfig(
+                forward_latency_cycles=2,
+                max_inflight_flits=2,
+            ),
+        )
+        pending = [Flit(data=index, dest_x=1, dest_y=0) for index in range(4)]
+        delivered = []
+        for cycle in range(30):
+            ready, ejected = mesh.tick(
+                {0: pending[0]} if pending else {},
+                {1: cycle >= 10},
+            )
+            if pending and ready[0]:
+                pending.pop(0)
+            if 1 in ejected and cycle >= 10:
+                delivered.append(ejected[1].data)
+            if len(delivered) == 4:
+                break
+        self.assertEqual(delivered, [0, 1, 2, 3])
 
 
 if __name__ == "__main__":

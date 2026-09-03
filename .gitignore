@@ -93,6 +93,7 @@ core.*
 /MAPPING_TEST_GUIDE.md
 
 # Agent/model working notes and local assistant configuration.
+/AGENTS.md
 **/AGENTS.md
 **/CLAUDE.md
 **/GEMINI.md

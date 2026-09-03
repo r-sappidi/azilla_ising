@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Iterable
 
@@ -25,6 +26,134 @@ class Flit:
     epoch: int = 0
     block_id: int = 0
     last: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class InterconnectConfig:
+    """Timing contract for every directed inter-H1 physical link.
+
+    ``forward_latency_cycles`` is additional latency beyond the legacy
+    directly connected RTL mesh. Zero therefore preserves the existing RTL
+    differential. ``flit_interval_cycles`` is the minimum number of cycles
+    between accepted logical 256-bit flits. ``max_inflight_flits`` is the
+    credit window shared by flits in flight, queued at the receiver, and
+    awaiting credit return. A credit becomes reusable
+    ``credit_return_latency_cycles`` after the destination router accepts the
+    flit.
+    """
+
+    forward_latency_cycles: int = 0
+    flit_interval_cycles: int = 1
+    max_inflight_flits: int = 4
+    credit_return_latency_cycles: int = 0
+
+    def __post_init__(self) -> None:
+        if self.forward_latency_cycles < 0:
+            raise ValueError("link forward latency cannot be negative")
+        if self.flit_interval_cycles <= 0:
+            raise ValueError("link flit interval must be positive")
+        if self.max_inflight_flits <= 0:
+            raise ValueError("link credit capacity must be positive")
+        if self.credit_return_latency_cycles < 0:
+            raise ValueError("link credit-return latency cannot be negative")
+
+    @property
+    def is_rtl_direct(self) -> bool:
+        return (
+            self.forward_latency_cycles == 0
+            and self.flit_interval_cycles == 1
+            and self.credit_return_latency_cycles == 0
+        )
+
+
+@dataclass(slots=True)
+class _DirectedLink:
+    """One credit-controlled, ordered, directed physical link."""
+
+    config: InterconnectConfig
+    cycle: int = 0
+    next_launch_cycle: int = 0
+    credits_in_use: int = 0
+    inflight: deque[tuple[int, Flit]] = field(default_factory=deque)
+    arrived: deque[Flit] = field(default_factory=deque)
+    credit_returns: deque[int] = field(default_factory=deque)
+
+    @property
+    def can_launch(self) -> bool:
+        return (
+            self.cycle >= self.next_launch_cycle
+            and self.credits_in_use < self.config.max_inflight_flits
+        )
+
+    @property
+    def output(self) -> Flit | None:
+        return self.arrived[0] if self.arrived else None
+
+    @property
+    def has_data(self) -> bool:
+        return bool(self.inflight or self.arrived)
+
+    def reset(self) -> None:
+        self.cycle = 0
+        self.next_launch_cycle = 0
+        self.credits_in_use = 0
+        self.inflight.clear()
+        self.arrived.clear()
+        self.credit_returns.clear()
+
+    def _advance_control(self, new_cycle: int) -> None:
+        self.cycle = new_cycle
+        while self.credit_returns and self.credit_returns[0] <= self.cycle:
+            self.credit_returns.popleft()
+            self.credits_in_use -= 1
+        while self.inflight and self.inflight[0][0] <= self.cycle:
+            _, flit = self.inflight.popleft()
+            self.arrived.append(flit)
+        if self.credits_in_use < 0:
+            raise RuntimeError("link returned more credits than it consumed")
+
+    def tick(
+        self,
+        source_flit: Flit | None,
+        *,
+        launch_accepted: bool,
+        delivery_accepted: bool,
+    ) -> None:
+        """Sample one edge after Mesh computes the two handshakes."""
+
+        if delivery_accepted:
+            if self.config.forward_latency_cycles == 0:
+                if not launch_accepted or source_flit is None:
+                    raise RuntimeError("direct-link delivery lacks a launch")
+            else:
+                if not self.arrived:
+                    raise RuntimeError("link delivered without an arrived flit")
+                self.arrived.popleft()
+            self.credit_returns.append(
+                self.cycle + self.config.credit_return_latency_cycles + 1
+            )
+
+        if launch_accepted:
+            if source_flit is None or not self.can_launch:
+                raise RuntimeError("link launch violated ready/valid")
+            self.credits_in_use += 1
+            self.next_launch_cycle = (
+                self.cycle + self.config.flit_interval_cycles
+            )
+            if self.config.forward_latency_cycles > 0:
+                self.inflight.append((
+                    self.cycle + self.config.forward_latency_cycles,
+                    source_flit,
+                ))
+
+        self._advance_control(self.cycle + 1)
+
+    def advance_idle(self, cycles: int) -> None:
+        if cycles < 0:
+            raise ValueError("cannot advance a link backward")
+        if self.has_data:
+            raise RuntimeError("cannot skip a link containing flit data")
+        self._advance_control(self.cycle + cycles)
 
 
 @dataclass(slots=True)
@@ -221,21 +350,87 @@ class FlooRouter:
 class Mesh:
     """Synchronous rectangular mesh of :class:`FlooRouter` instances."""
 
-    def __init__(self, width: int, height: int, fifo_depth: int = 4):
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fifo_depth: int = 4,
+        interconnect: InterconnectConfig | None = None,
+    ):
         if width <= 0 or height <= 0:
             raise ValueError("mesh dimensions must be positive")
         self.width = width
         self.height = height
+        self.interconnect = interconnect or InterconnectConfig()
         self.routers = [FlooRouter(x, y, fifo_depth)
                         for y in range(height) for x in range(width)]
+        self.links: dict[tuple[int, int], _DirectedLink] = {}
+        for node, router in enumerate(self.routers):
+            for out_port, nx, ny, _ in self._neighbors(router):
+                if 0 <= nx < self.width and 0 <= ny < self.height:
+                    self.links[(node, out_port)] = _DirectedLink(
+                        self.interconnect
+                    )
         self.cycle = 0
 
     def _index(self, x: int, y: int) -> int:
         return y * self.width + x
 
+    @staticmethod
+    def _neighbors(router: FlooRouter):
+        return (
+            (NORTH, router.x, router.y - 1, SOUTH),
+            (SOUTH, router.x, router.y + 1, NORTH),
+            (EAST, router.x + 1, router.y, WEST),
+            (WEST, router.x - 1, router.y, EAST),
+        )
+
+    def link_ready(
+        self,
+        node: int,
+        output_port: int,
+        router_outputs: list[RouterOutputs] | None = None,
+    ) -> bool:
+        """Return the source-router ready seen on one cardinal output."""
+
+        link = self.links.get((node, output_port))
+        if link is None or not link.can_launch:
+            return False
+        if self.interconnect.forward_latency_cycles > 0:
+            return True
+        outputs = router_outputs or [router.outputs() for router in self.routers]
+        router = self.routers[node]
+        _, nx, ny, neighbor_input = next(
+            item for item in self._neighbors(router) if item[0] == output_port
+        )
+        neighbor = self._index(nx, ny)
+        return outputs[neighbor].input_ready[neighbor_input]
+
+    @property
+    def has_link_data(self) -> bool:
+        return any(link.has_data for link in self.links.values())
+
+    @property
+    def has_data(self) -> bool:
+        return (
+            self.has_link_data
+            or any(fifo.queue for router in self.routers for fifo in router.fifos)
+        )
+
+    def advance_idle(self, cycles: int) -> None:
+        """Bulk-advance serializer/credit timers while no flits exist."""
+
+        if self.has_data:
+            raise RuntimeError("cannot skip a non-empty mesh")
+        for link in self.links.values():
+            link.advance_idle(cycles)
+        self.cycle += cycles
+
     def reset(self) -> None:
         for router in self.routers:
             router.reset()
+        for link in self.links.values():
+            link.reset()
         self.cycle = 0
 
     def tick(
@@ -254,28 +449,53 @@ class Mesh:
         ejections: dict[int, Flit] = {}
 
         for node, router in enumerate(self.routers):
-            x, y = router.x, router.y
             inputs[node][LOCAL] = local_injections.get(node)
             injection_ready[node] = comb[node].input_ready[LOCAL]
             output_ready[node][LOCAL] = local_ready.get(node, True)
             if comb[node].output_flits[LOCAL] is not None:
                 ejections[node] = comb[node].output_flits[LOCAL]  # type: ignore[assignment]
 
-            neighbors = (
-                (NORTH, x, y - 1, SOUTH),
-                (SOUTH, x, y + 1, NORTH),
-                (EAST, x + 1, y, WEST),
-                (WEST, x - 1, y, EAST),
-            )
-            for out_port, nx, ny, neighbor_in in neighbors:
+            for out_port, nx, ny, neighbor_in in self._neighbors(router):
                 if 0 <= nx < self.width and 0 <= ny < self.height:
                     neighbor = self._index(nx, ny)
-                    inputs[neighbor][neighbor_in] = comb[node].output_flits[out_port]
-                    output_ready[node][out_port] = comb[neighbor].input_ready[neighbor_in]
+                    link = self.links[(node, out_port)]
+                    if self.interconnect.forward_latency_cycles == 0:
+                        if link.can_launch:
+                            inputs[neighbor][neighbor_in] = (
+                                comb[node].output_flits[out_port]
+                            )
+                        output_ready[node][out_port] = (
+                            link.can_launch
+                            and comb[neighbor].input_ready[neighbor_in]
+                        )
+                    else:
+                        inputs[neighbor][neighbor_in] = link.output
+                        output_ready[node][out_port] = link.can_launch
                 else:
                     output_ready[node][out_port] = False
 
         for node, router in enumerate(self.routers):
             router.tick(inputs[node], output_ready[node])
+        for node, router in enumerate(self.routers):
+            for out_port, nx, ny, neighbor_in in self._neighbors(router):
+                if not (0 <= nx < self.width and 0 <= ny < self.height):
+                    continue
+                neighbor = self._index(nx, ny)
+                link = self.links[(node, out_port)]
+                source_flit = comb[node].output_flits[out_port]
+                launch_accepted = (
+                    source_flit is not None and output_ready[node][out_port]
+                )
+                delivery_accepted = (
+                    launch_accepted
+                    if self.interconnect.forward_latency_cycles == 0
+                    else link.output is not None
+                    and comb[neighbor].input_ready[neighbor_in]
+                )
+                link.tick(
+                    source_flit,
+                    launch_accepted=launch_accepted,
+                    delivery_accepted=delivery_accepted,
+                )
         self.cycle += 1
         return injection_ready, ejections

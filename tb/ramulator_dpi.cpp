@@ -37,6 +37,7 @@ struct MemorySystem {
     std::deque<Completion> completed;
     uint64_t accepted = 0;
     uint64_t rejected = 0;
+    uint64_t completed_count = 0;
     uint64_t latency_sum = 0;
     uint64_t latency_max = 0;
 };
@@ -165,6 +166,7 @@ extern "C" int az_dram_send(int system_id, uint64_t address, int tag) {
         [system_id, address, tag, issued](Ramulator::Request& request) {
             auto& completed_system = systems[size_t(system_id)];
             const uint64_t latency = memory_tick - issued;
+            completed_system.completed_count++;
             completed_system.latency_sum += latency;
             completed_system.latency_max =
                 std::max(completed_system.latency_max, latency);
@@ -209,14 +211,32 @@ extern "C" void az_dram_report() {
     for (size_t index = 0; index < systems.size(); ++index) {
         auto& system = systems[index];
         system.memory->update_stats_recursive();
-        const double average = system.accepted == 0
-            ? 0.0 : double(system.latency_sum) / double(system.accepted);
-        std::printf("DRAM[%zu] accepted=%llu rejected=%llu avg_latency_ticks=%.2f max_latency_ticks=%llu\n",
+        const double average = system.completed_count == 0
+            ? 0.0 : double(system.latency_sum) / double(system.completed_count);
+        std::printf("DRAM[%zu] accepted=%llu rejected=%llu completed=%llu avg_latency_ticks=%.2f max_latency_ticks=%llu\n",
                     index,
                     static_cast<unsigned long long>(system.accepted),
-                    static_cast<unsigned long long>(system.rejected), average,
+                    static_cast<unsigned long long>(system.rejected),
+                    static_cast<unsigned long long>(system.completed_count), average,
                     static_cast<unsigned long long>(system.latency_max));
     }
+}
+
+extern "C" int az_dram_get_stats(int system_id,
+                                  uint64_t* accepted,
+                                  uint64_t* rejected,
+                                  uint64_t* completed,
+                                  uint64_t* latency_sum,
+                                  uint64_t* latency_max) {
+    if (system_id < 0 || size_t(system_id) >= systems.size())
+        return 0;
+    const auto& system = systems[size_t(system_id)];
+    *accepted = system.accepted;
+    *rejected = system.rejected;
+    *completed = system.completed_count;
+    *latency_sum = system.latency_sum;
+    *latency_max = system.latency_max;
+    return 1;
 }
 
 extern "C" void az_dram_finalize() {

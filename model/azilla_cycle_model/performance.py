@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from .noc import Flit, EAST, LOCAL, NORTH, SOUTH, WEST
+from .noc import Flit, EAST, LOCAL, NORTH, SOUTH, WEST, InterconnectConfig
 from .adapters import NOC_PARTIAL, NOC_STATE, RoutedPartial
 from .scheduler import (
     CROSS, H0, H1, ConcurrentDispatcher, DirectDispatcher, DispatchPort, WorkTarget,
@@ -33,6 +33,15 @@ class PerformanceConfig:
     noise_decay: int = 0
     max_cycles: int = 1_000_000_000
     timing_only: bool = False
+    chiplet_link_latency_cycles: int = 0
+    interconnect: InterconnectConfig = InterconnectConfig()
+    execution_mode: str = "cir"
+
+    def __post_init__(self) -> None:
+        if self.chiplet_link_latency_cycles < 0:
+            raise ValueError("chiplet link latency must be non-negative")
+        if self.execution_mode not in {"cir", "cores-only", "hybrid"}:
+            raise ValueError(f"unknown execution mode {self.execution_mode!r}")
 
 
 @dataclass(slots=True)
@@ -80,6 +89,12 @@ class DirectPerformanceModel:
         self.geometry = geometry
         self.dataset = dataset
         self.config = config or PerformanceConfig()
+        if self.config.execution_mode != "cir":
+            raise NotImplementedError(
+                "cores-only is currently implemented by the calibrated event "
+                "model; direct RTL-structured execution requires dedicated "
+                "destination-core memory frontends"
+            )
         if dataset.spin_count != geometry.spin_count:
             raise ValueError(
                 f"dataset has {dataset.spin_count} spins, geometry has "
@@ -92,6 +107,7 @@ class DirectPerformanceModel:
             cross_mvm_count=self.config.cross_mvm_count,
             fifo_depth=self.config.fifo_depth,
             timing_only=self.config.timing_only,
+            interconnect=self.config.interconnect,
         )
         self.counters = PerformanceCounters()
         self.last_outputs: SystemCycleOutputs | None = None
@@ -122,7 +138,7 @@ class DirectPerformanceModel:
         return values
 
     def _router_activity(self) -> bool:
-        return any(
+        return self.system.mesh.has_link_data or any(
             flit is not None
             for router in self.system.mesh.routers
             for flit in router.outputs().output_flits
@@ -173,10 +189,7 @@ class DirectPerformanceModel:
                 flit = output.output_flits[port]
                 if flit is None:
                     continue
-                ready = False
-                if 0 <= nx < self.geometry.mesh_x and 0 <= ny < self.geometry.mesh_y:
-                    neighbor = ny * self.geometry.mesh_x + nx
-                    ready = comb[neighbor].input_ready[neighbor_input]
+                ready = self.system.mesh.link_ready(node, port, comb)
                 if ready:
                     self.counters.physical_link_flits += 1
                 else:

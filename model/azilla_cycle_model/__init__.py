@@ -7,13 +7,13 @@ read from ``outputs`` immediately before that edge.
 
 from .config import ArchitectureConfig
 from .compute import MVM, SpinCore, SymmetricMVM, SynchronousBlockSram
-from .noc import Flit, FlooRouter, Mesh
+from .noc import Flit, FlooRouter, InterconnectConfig, Mesh
 from .hierarchy import DmaCommand, HierarchyNode, PartialOutput
 from .memory import DramWeightStreamer, MemoryRequest, MemoryResponse
 from .adapters import H0Adapter, H1ChildAdapter, H1NocAdapter
 from .tiles import H0Tile, H1Tile
 from .cross import CrossH1Node, LocalInjectionArbiter
-from .ramulator import RamulatorBackend
+from .ramulator import RamulatorBackend, RamulatorSystemStats
 from .workload import BlockOccupancyDataset, Geometry, IsingDataset, ScheduledBlock
 from .system import IsingMeshSystem
 from .scheduler import (
@@ -26,10 +26,18 @@ from .performance import (
 )
 from .events import (
     EventCompressedMesh, EventCompressedPerformanceModel,
-    EventPerformanceConfig, EventPerformanceResult, EventTimingProfile,
+    EventNodeStats, EventNocResourceStats, EventPerformanceConfig,
+    EventPerformanceResult, EventTimingProfile, EventWorkResourceStats,
     EventLoop, NetworkReplayResult, PacketRelease,
 )
-from .exact_events import ExactEventResult, RamulatorEventPerformanceModel
+from .exact_events import (
+    DramPerformanceStats, ExactEventResult, NocResourceStats,
+    NodePerformanceStats, RamulatorEventPerformanceModel,
+)
+from .metrics import (
+    write_event_performance_metrics, write_exact_event_metrics,
+    write_transfer_trace,
+)
 from .mapping_adapter import (
     MappingArtifact, artifact_from_mapping, assign_cross_owners,
     load_sparse_dataset_arrays, map_sparse_dataset, write_permuted_dataset,
@@ -39,6 +47,7 @@ __all__ = [
     "ArchitectureConfig",
     "Flit",
     "FlooRouter",
+    "InterconnectConfig",
     "DmaCommand",
     "HierarchyNode",
     "H0Adapter",
@@ -49,6 +58,7 @@ __all__ = [
     "CrossH1Node",
     "LocalInjectionArbiter",
     "RamulatorBackend",
+    "RamulatorSystemStats",
     "Geometry",
     "IsingDataset",
     "BlockOccupancyDataset",
@@ -81,12 +91,21 @@ __all__ = [
     "EventCompressedPerformanceModel",
     "EventPerformanceConfig",
     "EventPerformanceResult",
+    "EventNocResourceStats",
+    "EventNodeStats",
+    "EventWorkResourceStats",
     "EventTimingProfile",
     "EventLoop",
     "NetworkReplayResult",
     "PacketRelease",
     "ExactEventResult",
+    "NocResourceStats",
+    "NodePerformanceStats",
+    "DramPerformanceStats",
     "RamulatorEventPerformanceModel",
+    "write_exact_event_metrics",
+    "write_event_performance_metrics",
+    "write_transfer_trace",
     "MappingArtifact",
     "artifact_from_mapping",
     "assign_cross_owners",

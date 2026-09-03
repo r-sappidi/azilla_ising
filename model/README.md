@@ -29,8 +29,9 @@ Current implemented and unit-tested primitives:
 - configured one-VC FlooNoC router and rectangular mesh, including registered
   input FIFOs, XY routing, wormhole locks, backpressure, and fair arbitration.
 
-The remaining integration work is tracked in `MODEL_STATUS.md`.  A component
-is not called cycle-exact there until an RTL differential trace passes.
+A component or configuration is only described as RTL-differential when the
+corresponding trace comparison passes. Larger untested geometries retain the
+accuracy label emitted by the CLI.
 
 Run the Python unit tests from the repository root:
 
@@ -57,9 +58,8 @@ python3 scripts/check_16k_cycle_model.py
 ```
 
 This passes for the audited timing-only 4x4/2-H0/16-core configuration and
-compares phase timing, all NoC stall totals, and every accepted transfer.  See
-`MODEL_STATUS.md` for the exact scope and the distinction between 16K timing
-verification and end-to-end arithmetic-payload verification.
+compares phase timing, all NoC stall totals, and every accepted transfer. This
+timing coverage is separate from end-to-end arithmetic-payload verification.
 
 Run the arithmetic-enabled three-way 16K state audit with:
 
@@ -71,8 +71,7 @@ This compares every next-state bit among the Python Ramulator model, the
 non-timing-only RTL simulation, and an independent graph-equation reference in
 `scripts/generate_matlab_golden.m`.  The local automated run uses GNU Octave to
 execute the MATLAB-compatible `.m` file; it does not claim execution by a
-licensed MathWorks MATLAB binary.  See `MODEL_STATUS.md` for exact parameters,
-results, and remaining coverage limits.
+licensed MathWorks MATLAB binary.
 
 Validate that a mapping contains every required sparse block exactly once:
 
@@ -115,6 +114,65 @@ PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-events \
   --mesh-x 2 --mesh-y 1 --h0-per-h1 2 --cores-per-h0 2
 ```
 
+## CIR and cores-only execution modes
+
+The event-compressed commands accept `--execution-mode cir`,
+`--execution-mode cores-only`, or `--execution-mode hybrid`. The default is
+`cir`.
+
+- `cir` assigns every occupied unordered 32-by-32 interaction block to its
+  native H0, H1-local, or cross-H1 symmetric MVM. One job produces partials
+  for both endpoint blocks.
+- `cores-only` assigns the two directions of every interaction to the two
+  destination spin cores. It performs two directed jobs and does not return
+  partial packets from the hierarchy.
+- `hybrid` constructs a static, exclusive partition: some interactions run at
+  their destination cores and the remainder use their native CIR pool.
+
+For a controlled comparison, keep the dataset, geometry, engine counts,
+interconnect parameters, and iteration count identical and change only the
+execution mode:
+
+```bash
+for mode in cir cores-only; do
+  PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-events \
+    --dataset tb/datasets/g16384_kings.txt \
+    --mesh-x 4 --mesh-y 4 --h0-per-h1 2 --cores-per-h0 16 \
+    --h0-mvms 4 --h1-mvms 2 --cross-mvms 4 \
+    --execution-mode "$mode" \
+    --metrics-prefix "results/execution_modes/$mode"
+done
+```
+
+Use the live-Ramulator exact-event path for finalist timing by replacing
+`simulate-events` with `simulate-exact-events` and supplying the Ramulator
+library and configuration:
+
+```bash
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-exact-events \
+  --dataset tb/datasets/g16384_kings.txt \
+  --mesh-x 4 --mesh-y 4 --h0-per-h1 2 --cores-per-h0 16 \
+  --h0-mvms 4 --h1-mvms 2 --cross-mvms 4 \
+  --execution-mode cores-only \
+  --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
+  --ramulator-config tb/ramulator_128x32.yaml \
+  --idle-refresh-period-ticks 7600 \
+  --metrics-prefix results/execution_modes/cores_only_exact
+```
+
+The underscore spelling `core_only` is not accepted; use `cores-only` exactly.
+Mapped commands support the same option. Always pair a mapped artifact with
+its permuted dataset for live-Ramulator or functional execution. These modes
+change where interaction arithmetic is assigned; they do not change the Ising
+update equation.
+
+Calibrated results are screening estimates. Exact-event mode retains live
+Ramulator timing but is timing-only and does not by itself verify arithmetic.
+The current strict CIR trace differential covers the documented small and 16K
+configurations. Cores-only has unit/component RTL coverage, but a full-system
+64K RTL differential has not yet completed. Preserve the CLI accuracy label in
+reported results.
+
 The event model removes spin/MVM arithmetic and schedules endpoint completion
 events. Empty NoC intervals are jumped over but remain in the reported cycle
 count; every active or contended NoC cycle uses the same RTL-differentially
@@ -145,12 +203,84 @@ PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-exact-events \
   --h0-mvms 1 --h1-mvms 1 --cross-mvms 16 \
   --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
   --ramulator-config tb/ramulator_128x32.yaml \
-  --idle-refresh-period-ticks 7600
+  --idle-refresh-period-ticks 7600 \
+  --metrics-prefix results/g16384/exact \
+  --transfer-trace results/g16384/exact_transfers.csv
 ```
+
+`--metrics-prefix` writes summary JSON and per-resource NoC, per-node work, and
+per-memory-system DRAM CSVs. `--transfer-trace` optionally writes every
+accepted injection, hop, and ejection. Counter collection is always enabled in
+the result object; these options only control file output.
 
 `scripts/check_exact_event_model.py` verifies both the 256-spin and 16K cases
 against stored RTL traces. It compares phase timing, all NoC stall totals, and
 every accepted injection, hop, and ejection by cycle and packet metadata.
+
+### Parameterized inter-H1 physical links
+
+All simulation modes accept the following per-direction link parameters:
+
+- `--link-latency-cycles`: additional one-way latency per physical H1 hop
+  beyond the directly connected RTL mesh;
+- `--link-flit-interval-cycles`: minimum cycles between accepted logical
+  256-bit flits, representing serialization/effective bandwidth;
+- `--link-max-inflight-flits`: finite credit window including flits in flight,
+  queued at the receiver, and awaiting credit return;
+- `--link-credit-return-cycles`: delay after receiver acceptance before the
+  corresponding credit is reusable.
+
+The defaults (`0`, `1`, `4`, `0`) preserve the RTL-connected mesh and its
+differential traces. A non-default physical-link experiment is labeled
+`parameterized-interconnect-projection`. For example:
+
+```bash
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-exact-events \
+  --dataset tb/datasets/g16384_kings.txt \
+  --mesh-x 4 --mesh-y 4 --h0-per-h1 2 --cores-per-h0 16 \
+  --h0-mvms 1 --h1-mvms 1 --cross-mvms 16 \
+  --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
+  --ramulator-config tb/ramulator_128x32.yaml \
+  --link-latency-cycles 10 \
+  --link-flit-interval-cycles 2 \
+  --link-max-inflight-flits 32 \
+  --link-credit-return-cycles 10
+```
+
+The model remains flit-level and full-duplex. Each directed link separately
+enforces its launch interval and credit window; delayed flits participate in
+downstream router arbitration and backpressure after arrival. Exact-event
+summary JSON records the complete interconnect configuration.
+
+### Package-internal chiplet latency
+
+The event and exact-event commands also accept one package-local parameter:
+
+- `--chiplet-link-latency-cycles`: additional one-way latency for a
+  fully-pipelined crossing between chiplets inside one H1 package.
+
+It is charged at the modeled package crossings: H0 state publication to the
+H1/top endpoint, H0 state snapshotting into the H1-local hierarchy node, and
+the return of H1-local or cross-H1 partials to the destination H0 tile. A
+latency-only internal fabric is assumed, so this value shifts pipeline startup
+and tail events but does not reduce throughput or add credits/backpressure.
+Ramulator continues to model each attached GDDR device; this parameter does
+not add a second delay to the GDDR command/data interface.
+
+For an H1-package projection with eight additional cycles per internal
+chiplet crossing:
+
+```bash
+PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-exact-events \
+  ... \
+  --chiplet-link-latency-cycles 8
+```
+
+The zero default preserves the RTL timing contract. Any nonzero value is
+reported as `parameterized-interconnect-projection`, because the current RTL
+contains direct wires at these boundaries rather than a physical chiplet-link
+implementation. The selected value is printed by the CLI and written to the
+summary JSON under `package.chiplet_link_latency_cycles`.
 
 The million-spin 256-8-16 command is:
 

@@ -3,9 +3,30 @@
 from __future__ import annotations
 
 import ctypes
+from dataclasses import dataclass
 from pathlib import Path
 
 from .memory import MemoryResponse
+
+
+@dataclass(frozen=True, slots=True)
+class RamulatorSystemStats:
+    accepted: int
+    rejected: int
+    completed: int
+    latency_sum_ticks: int
+    latency_max_ticks: int
+
+    @property
+    def outstanding(self) -> int:
+        return self.accepted - self.completed
+
+    @property
+    def average_latency_ticks(self) -> float:
+        return (
+            self.latency_sum_ticks / self.completed
+            if self.completed else 0.0
+        )
 
 
 class RamulatorBackend:
@@ -38,6 +59,15 @@ class RamulatorBackend:
             ctypes.POINTER(ctypes.c_uint32),
         ]
         self.library.az_dram_pop.restype = ctypes.c_int
+        self.library.az_dram_get_stats.argtypes = [
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self.library.az_dram_get_stats.restype = ctypes.c_int
         self.library.az_dram_report.argtypes = []
         self.library.az_dram_finalize.argtypes = []
         init(
@@ -68,6 +98,14 @@ class RamulatorBackend:
 
     def report(self) -> None:
         self.library.az_dram_report()
+
+    def stats(self, system: int) -> RamulatorSystemStats:
+        values = [ctypes.c_uint64() for _ in range(5)]
+        if not self.library.az_dram_get_stats(
+            system, *(ctypes.byref(value) for value in values)
+        ):
+            raise IndexError(f"Ramulator system {system} is out of range")
+        return RamulatorSystemStats(*(value.value for value in values))
 
     def finalize(self) -> None:
         if not self.closed:

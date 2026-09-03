@@ -1,4 +1,8 @@
 VERILATOR ?= verilator
+VERILATOR_JOBS ?= 1
+VERILATOR_OUTPUT_SPLIT ?= 0
+VERILATOR_ROOT ?= $(shell $(VERILATOR) -V 2>/dev/null | strings | sed -n 's/^[[:space:]]*VERILATOR_ROOT[[:space:]]*=[[:space:]]*//p' | head -1)
+VERILATOR_INCLUDE ?= $(VERILATOR_ROOT)/include
 RTL_DIR := ../rtl
 BUILD_DIR := ../build/spin_core_tb
 TOP := spin_core_tb
@@ -43,8 +47,50 @@ HYBRID_SCHEDULE_ARG = $(if $(HYBRID_SCHEDULE),--schedule $(HYBRID_SCHEDULE),)
 FLOO_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_s$(SKIP_ZERO_BLOCKS)_r$(USE_RAMULATOR)_i$(ITERATION_COUNT)_t$(TIMING_ONLY)
 FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
+VERILATOR_SPLIT_FLAGS := $(if $(filter-out 0,$(VERILATOR_OUTPUT_SPLIT)),--output-split $(VERILATOR_OUTPUT_SPLIT) --output-split-cfuncs $(VERILATOR_OUTPUT_SPLIT),)
 
-.PHONY: all run floo-router-test floo-mesh-test floo-mesh-dram-test ramulator-config dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
+.PHONY: all run core-local-baseline-256-test core-local-baseline-256-vcs-test static-hybrid-256-test static-hybrid-256-vcs-test floo-router-test floo-mesh-build floo-mesh-test floo-mesh-dram-test ramulator-config dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
+
+static-hybrid-256-test:
+	mkdir -p ../build/static_hybrid_256_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module static_hybrid_256_tb --Mdir build/static_hybrid_256_tb \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv \
+		rtl/symmetric_mvm.sv rtl/hierarchy_node.sv \
+		rtl/core_local_mvm_engine.sv tb/static_hybrid_256_tb.sv
+	../build/static_hybrid_256_tb/Vstatic_hybrid_256_tb
+
+static-hybrid-256-vcs-test:
+	mkdir -p ../build/static_hybrid_256_vcs
+	cd ../build/static_hybrid_256_vcs && \
+		export VCS_HOME=$${VCS_HOME:-/home/hwpeng/vcs} && \
+		$$VCS_HOME/bin/vcs -full64 -sverilog -timescale=1ns/1ps \
+		-LDFLAGS '-no-pie' -top static_hybrid_256_tb \
+		../../rtl/ising_pkg.sv ../../rtl/j_block_sram.sv ../../rtl/mvm.sv \
+		../../rtl/symmetric_mvm.sv ../../rtl/hierarchy_node.sv \
+		../../rtl/core_local_mvm_engine.sv ../../tb/static_hybrid_256_tb.sv \
+		-o simv && ./simv
+
+core-local-baseline-256-test:
+	mkdir -p ../build/core_local_baseline_256_tb
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		--top-module core_local_baseline_256_tb \
+		--Mdir build/core_local_baseline_256_tb \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv \
+		rtl/core_local_mvm_engine.sv tb/core_local_baseline_256_tb.sv
+	../build/core_local_baseline_256_tb/Vcore_local_baseline_256_tb
+
+core-local-baseline-256-vcs-test:
+	mkdir -p ../build/core_local_baseline_256_vcs
+	cd ../build/core_local_baseline_256_vcs && \
+		export VCS_HOME=$${VCS_HOME:-/home/hwpeng/vcs} && \
+		$$VCS_HOME/bin/vcs -full64 -sverilog \
+		-timescale=1ns/1ps -LDFLAGS '-no-pie' \
+		-top core_local_baseline_256_tb \
+		../../rtl/ising_pkg.sv ../../rtl/j_block_sram.sv ../../rtl/mvm.sv \
+		../../rtl/core_local_mvm_engine.sv \
+		../../tb/core_local_baseline_256_tb.sv -o simv
+	../build/core_local_baseline_256_vcs/simv
 
 cycle-model-compute-trace-build:
 	mkdir -p ../build/cycle_model_compute_trace_tb
@@ -81,8 +127,8 @@ cycle-model-router-trace-build:
 cycle-model-ramulator-library:
 	mkdir -p ../build/cycle_model_ramulator
 	$(CXX) -std=c++20 -shared -fPIC \
-		-I$(abspath $(RAMULATOR_DIR)/src) -I/usr/share/verilator/include \
-		-I/usr/share/verilator/include/vltstd \
+		-I$(abspath $(RAMULATOR_DIR)/src) -I$(VERILATOR_INCLUDE) \
+		-I$(VERILATOR_INCLUDE)/vltstd \
 		$(abspath ramulator_dpi.cpp) \
 		-L$(abspath $(RAMULATOR_DIR)) -lramulator \
 		-Wl,-rpath,$(abspath $(RAMULATOR_DIR)) \
@@ -209,11 +255,35 @@ ramulator-node-perf-test:
 	cd .. && build/ramulator_node_perf_$(PERF_CONFIG)/Vramulator_node_perf_tb \
 		+DATASET=$(PERF_DATASET)
 
-# Full accelerator hierarchy elaboration/reset smoke test using FlooNoC at
-# every top-level mesh location.
-floo-mesh-test:
+# Full accelerator hierarchy elaboration using FlooNoC at every top-level
+# mesh location. Keeping compilation on the binary target allows large scale
+# sweeps to build without running and lets later simulations reuse the binary.
+$(FLOO_BUILD_DIR)/Vising_mesh_tb: \
+	$(RTL_DIR)/floo_router_files.f \
+	$(RTL_DIR)/ising_pkg.sv \
+	$(RTL_DIR)/j_block_sram.sv \
+	$(RTL_DIR)/mvm.sv \
+	$(RTL_DIR)/symmetric_mvm.sv \
+	$(RTL_DIR)/core.sv \
+	$(RTL_DIR)/hierarchy_node.sv \
+	$(RTL_DIR)/h0_adapter.sv \
+	$(RTL_DIR)/h0_tile.sv \
+	$(RTL_DIR)/h1_child_adapter.sv \
+	$(RTL_DIR)/h1_tile.sv \
+	$(RTL_DIR)/h1_noc_adapter.sv \
+	$(RTL_DIR)/cross_h1_node.sv \
+	$(RTL_DIR)/azilla_floo_router.sv \
+	$(RTL_DIR)/top_node.sv \
+	$(RTL_DIR)/mesh_h1_tile.sv \
+	$(RTL_DIR)/ising_mesh.sv \
+	$(RTL_DIR)/dram_weight_streamer.sv \
+	ramulator_dpi_bridge.sv \
+	ramulator_node_frontend.sv \
+	ising_mesh_tb.sv \
+	ramulator_dpi.cpp
 	mkdir -p $(FLOO_BUILD_DIR)
 	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		-j $(VERILATOR_JOBS) $(VERILATOR_SPLIT_FLAGS) \
 		$(TIMING_ONLY_FLAG) \
 		--top-module ising_mesh_tb \
 		--Mdir build/$(notdir $(FLOO_BUILD_DIR)) \
@@ -248,6 +318,15 @@ floo-mesh-test:
 		rtl/dram_weight_streamer.sv tb/ramulator_dpi_bridge.sv \
 		tb/ramulator_node_frontend.sv tb/ising_mesh_tb.sv \
 		$(abspath ramulator_dpi.cpp)
+
+# Elaborate and compile a full hierarchy without launching it.  This is the
+# appropriate target for scale sweeps whose datasets or simulations will be
+# supplied later.  The configuration-specific binary path remains identical
+# to floo-mesh-test, so a later run reuses this build.
+floo-mesh-build: $(FLOO_BUILD_DIR)/Vising_mesh_tb
+	@echo "built ../build/$(notdir $(FLOO_BUILD_DIR))/Vising_mesh_tb"
+
+floo-mesh-test: $(FLOO_BUILD_DIR)/Vising_mesh_tb
 	cd .. && build/$(notdir $(FLOO_BUILD_DIR))/Vising_mesh_tb \
 		+DATASET=$(DATASET) +NOC_STATS_FILE=$(NOC_STATS_FILE) $(SIM_ARGS)
 

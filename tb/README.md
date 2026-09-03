@@ -52,10 +52,11 @@ Supported variables and their defaults are:
 | `H1_MVM_COUNT` | 1 | MVM engines in each H1 node |
 | `CROSS_MVM_COUNT` | 1 | Cross-H1 MVM engines per mesh node |
 | `FIFO_DEPTH` | 4 | Partial-result FIFO depth |
-| `ITERATION_COUNT` | 1 | Ising iterations to simulate |
+| `ITERATION_COUNT` | 1 | Maximum iteration count supported by the compiled binary |
 | `SKIP_ZERO_BLOCKS` | 0 | Skip entirely zero off-diagonal blocks |
 | `DATASET` | `g256_smoke.txt` | File under `tb/datasets` |
 | `NOC_STATS_FILE` | `noc_stats.csv` | Per-link and per-endpoint NoC statistics output |
+| `INTERNAL_STATS_FILE` | `internal_stats.csv` | H0/H1/cross compute-interface statistics output |
 
 The implemented spin count is:
 
@@ -66,6 +67,76 @@ MESH_X_COUNT * MESH_Y_COUNT * H0_COUNT * CORES_PER_H0 * 32
 This must equal the vertex count in the dataset header. Mesh dimensions,
 hierarchy counts, engine counts, and FIFO depth must be supported powers of
 two; invalid configurations terminate with an explanatory error.
+
+The standalone RTL checks for the destination-stationary core engine and a
+mixed core/CIR arithmetic partition are:
+
+```bash
+make -C tb core-local-baseline-256-test
+make -C tb static-hybrid-256-test
+```
+
+Use the corresponding `*-vcs-test` targets for VCS. These are 256-spin
+subsystem checks; they do not establish full-mesh cores-only timing at larger
+geometries. The Python execution-mode commands and their validation scope are
+documented in `model/README.md`.
+
+`ITERATION_COUNT` sizes the compiled epoch fields and sets the default run
+length. A binary compiled for a larger maximum can select any positive run
+length up to that maximum at launch with `SIM_ARGS=+ITERATIONS=<count>`. For
+example, a binary built with `ITERATION_COUNT=1024` can be reused for 1, 10,
+or 100 iterations without rebuilding. External MATLAB/Octave golden files
+must contain the runtime-selected number of iterations.
+
+An optional runtime solver schedule supplies one `A B noise_amplitude` record
+per requested iteration:
+
+```text
+3 1 0
+3 1 0
+2 1 1
+```
+
+Pass it as `SIM_ARGS=+SOLVER_SCHEDULE=<path>`. Spin cores sample A and B at
+each iteration boundary; the noise amplitude is likewise selected before the
+iteration begins. Missing records are rejected instead of silently reusing a
+stale coefficient.
+
+### Build-only RTL scale sweep
+
+For long Verilator elaboration/compilation tests without immediately starting
+a dataset simulation, run:
+
+```bash
+JOBS=2 scripts/build_rtl_scale_sweep.sh 2>&1 | tee logs/rtl_scale_driver.log
+```
+
+The default sparse-reference series builds 16,384, 32,768, 65,536, and
+131,072 spins in increasing order. It uses the 4-by-4 H1 mesh, the audited
+16K hierarchy as its starting point, 1/1/16 H0/H1/cross MVM engines, sparse
+block skipping, Ramulator support, and timing-only RTL. Each configuration has
+its own build directory and log, so rerunning the command resumes through
+Make's normal timestamp checks. The script only compiles; it never launches
+the resulting binary.
+
+Start with one or two compiler jobs because generated C++ for large full-mesh
+configurations can consume substantial memory. Useful overrides include:
+
+```bash
+# Only the first two sizes.
+JOBS=2 scripts/build_rtl_scale_sweep.sh 16384 32768
+
+# Arithmetic-enabled 16K build.
+TIMING_ONLY=0 JOBS=2 scripts/build_rtl_scale_sweep.sh 16384
+
+# Try later sizes even if an earlier build fails.
+CONTINUE_ON_ERROR=1 scripts/build_rtl_scale_sweep.sh
+```
+
+Run `scripts/build_rtl_scale_sweep.sh --help` for all controls. The selected
+geometries are controlled sparse-scaling reference points, not a claim of a
+workload-independent optimum; MVM counts can be overridden through
+`H0_MVMS`, `H1_MVMS`, and `CROSS_MVMS`.
 
 ## Dataset format
 
@@ -149,6 +220,41 @@ packet metadata. Event output can be restricted without rebuilding using
 `+NOC_TRACE_START=<cycle>`, `+NOC_TRACE_END=<cycle>`, and
 `+NOC_TRACE_NODE=<linear_node_id>`. Leaving both trace-file plusargs unset
 disables temporal file I/O.
+
+The full-mesh testbench also observes the ready/valid boundaries internal to
+each H1 hierarchy. `INTERNAL_STATS_FILE` reports command, 256-bit weight-beat,
+state-table-load, and 256-bit partial-beat traffic for every H0 tile, H1-local
+compute node, and cross-H1 compute node. Each row includes offered and accepted
+lane-transfers, valid-but-not-ready lane-cycles, first and last acceptance
+cycles, capacity-normalized utilization, and backpressure fraction. Add
+`+INTERNAL_EVENT_FILE=<path>` to record a timestamped row for every cycle with
+one or more accepted internal lane-transfers. These monitors are testbench-only
+and do not modify the synthesizable interfaces.
+
+Check ready/valid and per-job volume conservation with:
+
+```bash
+python3 scripts/check_rtl_internal_stats.py logs/run_internal.csv
+```
+
+The checker verifies that offered traffic equals accepted plus stalled traffic
+and that every accepted symmetric block command has 32 weight beats and eight
+partial beats. It does not infer queue occupancy inside an MVM or memory
+controller; the observed stall count is limited to exposed ready/valid
+boundaries.
+
+Generate aggregate tables and publication-ready PNG/PDF plots for one or more
+runs with:
+
+```bash
+python3 scripts/plot_rtl_internal_stats.py \
+  results/run_a/internal.csv results/run_b/internal.csv \
+  --labels run_a run_b --output-dir plots/internal_comparison
+```
+
+The output includes hierarchy-level traffic volume and composition, capacity
+utilization and backpressure, first-to-last activity spans, per-run endpoint
+heatmaps, a long-form metrics table, and a critical-endpoint ranking.
 
 Postprocess a trace using only the Python standard library:
 

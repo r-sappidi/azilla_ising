@@ -397,7 +397,10 @@ module hierarchy_node #(
     // physical symmetric pair engine.
     generate
         for (genvar engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin : gen_engine_control
-            always_ff @(posedge clk) begin
+            // VCS 2017 cannot prove that generated processes write disjoint
+            // slices of these unpacked arrays and rejects always_ff here.
+            // This remains an edge-triggered sequential process.
+            always @(posedge clk) begin
                 if (rst) begin
                     engine_state[engine_index] <= ENGINE_IDLE;
                     output_state[engine_index] <= OUTPUT_IDLE;

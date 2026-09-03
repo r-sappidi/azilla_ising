@@ -2,7 +2,8 @@ import unittest
 
 from azilla_cycle_model.scheduler import (
     CROSS, H0, H1, ConcurrentDispatcher, DispatchPort, WorkTarget,
-    allocate_h1_pairs, compile_schedule,
+    allocate_h1_pairs, compile_cores_only_schedule,
+    compile_hybrid_schedule, compile_static_hybrid_schedule, compile_schedule,
 )
 from azilla_cycle_model.workload import Geometry, ScheduledBlock
 
@@ -27,6 +28,55 @@ class SchedulerTests(unittest.TestCase):
         ])
         self.assertEqual(schedule.counts, (1, 1, 1))
         self.assertEqual(schedule.publications(), ((0, 1), (4, 1)))
+
+    def test_cores_only_duplicates_work_at_destination_and_deduplicates_state(self):
+        geometry = Geometry(2, 1, 2, 2)
+        schedule = compile_cores_only_schedule(geometry, [
+            ScheduledBlock(0, 1),
+            ScheduledBlock(0, 2),
+            ScheduledBlock(0, 4),
+            ScheduledBlock(1, 4),
+        ])
+        self.assertEqual(schedule.directed_jobs, 8)
+        self.assertEqual(
+            [(work.block_a, work.block_b) for work in schedule.h0[0]],
+            [(0, 1), (1, 0), (0, 2), (0, 4), (1, 4)],
+        )
+        # Block 4 is cached once at destination H1 0 despite two consumers.
+        self.assertEqual(schedule.state_publications, ((0, 1), (1, 1), (4, 0)))
+
+    def test_static_hybrid_exclusive_partition_and_core_preference(self):
+        geometry = Geometry(2, 1, 2, 2)
+        pairs = [(0, b) for b in range(1, 8)]
+        schedule = compile_static_hybrid_schedule(
+            geometry, pairs, h0_mvm_count=1, h1_mvm_count=1,
+            cross_mvm_count=1,
+        )
+        self.assertEqual(
+            set(schedule.core_pairs) | set(schedule.cir_pairs), set(pairs)
+        )
+        self.assertFalse(set(schedule.core_pairs) & set(schedule.cir_pairs))
+        self.assertGreater(len(schedule.core_pairs), 0)
+        self.assertGreater(len(schedule.cir_pairs), 0)
+        self.assertEqual(schedule.directed_core_jobs, 2 * len(schedule.core_pairs))
+
+    def test_explicit_hybrid_partition_is_exclusive_and_preserves_owner(self):
+        geometry = Geometry(2, 1, 1, 2)
+        records = [ScheduledBlock(0, 1), ScheduledBlock(0, 2, 1)]
+        schedule = compile_hybrid_schedule(
+            geometry, records, core_pairs=[(0, 1)],
+        )
+        self.assertEqual(schedule.core_pairs, ((0, 1),))
+        self.assertEqual(schedule.cir_pairs, ((0, 2),))
+        self.assertEqual(schedule.directed_core_jobs, 2)
+        self.assertEqual(schedule.cir.counts, (0, 0, 1))
+        self.assertEqual(schedule.cir.cross[1][0].block_b, 2)
+
+    def test_explicit_hybrid_partition_rejects_unknown_pair(self):
+        with self.assertRaises(ValueError):
+            compile_hybrid_schedule(
+                Geometry(1, 1, 1, 2), [(0, 1)], core_pairs=[(0, 2)],
+            )
 
     def test_concurrent_dispatch_holds_valid_and_refills(self):
         geometry = Geometry(1, 1, 1, 4)

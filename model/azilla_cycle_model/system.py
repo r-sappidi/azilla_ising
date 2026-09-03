@@ -7,7 +7,7 @@ from typing import Any, Sequence
 
 from .adapters import H1NocAdapter, NOC_STATE, RoutedPartial
 from .cross import CrossH1Node, LocalInjectionArbiter
-from .noc import LOCAL, Flit, Mesh
+from .noc import LOCAL, Flit, InterconnectConfig, Mesh
 from .tiles import H1TileOutputs, H1Tile
 from .workload import Geometry
 
@@ -30,9 +30,12 @@ class IsingMeshSystem:
 
     def __init__(self, geometry: Geometry, *, h0_mvm_count: int = 1,
                  h1_mvm_count: int = 1, cross_mvm_count: int = 1,
-                 fifo_depth: int = 4, timing_only: bool = False):
+                 fifo_depth: int = 4, timing_only: bool = False,
+                 interconnect: InterconnectConfig | None = None):
         self.geometry = geometry
-        self.mesh = Mesh(geometry.mesh_x, geometry.mesh_y, fifo_depth)
+        self.mesh = Mesh(
+            geometry.mesh_x, geometry.mesh_y, fifo_depth, interconnect
+        )
         self.h1_tiles = [
             H1Tile(
                 geometry.h0_per_h1, geometry.cores_per_h0,

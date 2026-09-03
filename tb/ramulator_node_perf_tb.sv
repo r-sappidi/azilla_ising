@@ -52,7 +52,7 @@ module ramulator_node_perf_tb #(
   string dataset_name = "g65536_kings.txt";
   string config_name = "tb/ramulator_128x32.yaml";
 
-  import "DPI-C" function int az_dram_init(
+  import "DPI-C" function void az_dram_init(
     input string config_path, input string dataset_path,
     input int system_count, input int total_blocks);
   import "DPI-C" function void az_dram_tick(input int ticks);
@@ -172,9 +172,8 @@ module ramulator_node_perf_tb #(
     sched_cmd_global_a = '0;
     sched_cmd_global_b = '0;
 
-    if (az_dram_init(config_name, {"tb/datasets/", dataset_name}, 1,
-                     TOTAL_BLOCK_COUNT) != 0)
-      $fatal(1, "Ramulator initialization failed");
+    az_dram_init(config_name, {"tb/datasets/", dataset_name}, 1,
+                 TOTAL_BLOCK_COUNT);
     repeat (5) @(negedge clk);
     rst = 0;
 

@@ -19,6 +19,9 @@ from .workload import Geometry, ScheduledBlock
 H0 = "h0"
 H1 = "h1"
 CROSS = "cross"
+CIR = "cir"
+CORES_ONLY = "cores-only"
+HYBRID = "hybrid"
 
 
 def mesh_distance(geometry: Geometry, node_a: int, node_b: int) -> int:
@@ -114,6 +117,206 @@ class CompiledSchedule:
             for block in (work.block_a, work.block_b)
         }
         return tuple(sorted(needed))
+
+
+@dataclass(slots=True)
+class CoresOnlySchedule:
+    """Destination-stationary expansion of an unordered block schedule.
+
+    Every unordered off-diagonal block is evaluated once at each endpoint's
+    H0.  Thus the destination core accumulates its contribution locally and
+    no partial-vector packet is returned through the hierarchy.  ``state``
+    publications are deduplicated at H1 granularity: a source block is sent
+    once to every remote H1 containing at least one destination consumer.
+    """
+
+    geometry: Geometry
+    h0: list[deque[WorkItem]]
+    state_publications: tuple[tuple[int, int], ...]
+
+    @property
+    def directed_jobs(self) -> int:
+        return sum(map(len, self.h0))
+
+
+@dataclass(slots=True)
+class HybridSchedule:
+    """Exclusive static partition between destination cores and CIR pools."""
+
+    geometry: Geometry
+    core: CoresOnlySchedule
+    cir: CompiledSchedule
+    core_pairs: tuple[tuple[int, int], ...]
+    cir_pairs: tuple[tuple[int, int], ...]
+    predicted_service_cycles: int
+
+    @property
+    def directed_core_jobs(self) -> int:
+        return self.core.directed_jobs
+
+
+def compile_hybrid_schedule(
+    geometry: Geometry,
+    pairs: Iterable[ScheduledBlock | tuple[int, int]],
+    *,
+    core_pairs: Iterable[tuple[int, int]],
+) -> HybridSchedule:
+    """Compile an explicit, exclusive core/CIR interaction partition.
+
+    This is the experiment-facing counterpart to
+    :func:`compile_static_hybrid_schedule`.  ``core_pairs`` selects unordered
+    interaction blocks for destination-core execution; every remaining input
+    record retains its original CIR placement and optional cross-H1 owner.
+    """
+
+    records = list(pairs)
+    canonical = [_pair_tuple(record) for record in records]
+    selected_records = list(core_pairs)
+    selected = set(selected_records)
+    if len(selected) != len(selected_records):
+        raise ValueError("explicit hybrid core partition contains duplicates")
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("hybrid schedule contains a duplicate block pair")
+    unknown = selected - set(canonical)
+    if unknown:
+        raise ValueError(
+            f"explicit hybrid core partition contains unknown pairs: "
+            f"{sorted(unknown)[:4]}"
+        )
+    core_records = [pair for pair in canonical if pair in selected]
+    cir_records = [
+        record for record, pair in zip(records, canonical)
+        if pair not in selected
+    ]
+    core = compile_cores_only_schedule(geometry, core_records)
+    cir = compile_schedule(geometry, cir_records)
+    return HybridSchedule(
+        geometry, core, cir, tuple(core_records),
+        tuple(_pair_tuple(record) for record in cir_records), 0,
+    )
+
+
+def _pair_tuple(record: ScheduledBlock | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(record, ScheduledBlock):
+        return record.block_a, record.block_b
+    return record
+
+
+def compile_static_hybrid_schedule(
+    geometry: Geometry,
+    pairs: Iterable[ScheduledBlock | tuple[int, int]],
+    *,
+    h0_mvm_count: int,
+    h1_mvm_count: int,
+    cross_mvm_count: int,
+    core_block_cycles: int = 67,
+    h0_block_cycles: int = 67,
+    h1_block_cycles: int = 67,
+    cross_block_cycles: int = 67,
+) -> HybridSchedule:
+    """Choose a deterministic, core-preferred static hybrid partition.
+
+    Candidate partitions retain at each core at most ``threshold`` incident
+    blocks (in stable pair order) and spill the remainder to the block's
+    native CIR level.  All distinct core-degree thresholds are evaluated and
+    the partition minimizing the maximum nominal resource service time wins.
+    Ties prefer more core execution, making the policy core-preferred.
+    """
+
+    records = list(pairs)
+    canonical = [_pair_tuple(record) for record in records]
+    if any(not (0 <= a < b < geometry.total_blocks) for a, b in canonical):
+        raise ValueError("hybrid schedule contains an invalid block pair")
+    if len(set(canonical)) != len(canonical):
+        raise ValueError("hybrid schedule contains a duplicate block pair")
+    for name, value in (("h0", h0_mvm_count), ("h1", h1_mvm_count),
+                        ("cross", cross_mvm_count)):
+        if value <= 0:
+            raise ValueError(f"{name} MVM count must be positive")
+
+    degrees = [0] * geometry.total_blocks
+    for a, b in canonical:
+        degrees[a] += 1
+        degrees[b] += 1
+    maximum_degree = max(degrees, default=0)
+    if maximum_degree <= 256:
+        thresholds = list(range(maximum_degree + 1))
+    else:
+        # Bound compile time on extremely dense schedules while retaining
+        # intermediate load caps needed to balance skewed graphs.
+        thresholds = sorted({
+            round(maximum_degree * sample / 64) for sample in range(65)
+        } | set(degrees))
+
+    best = None
+    for threshold in thresholds:
+        retained = [0] * geometry.total_blocks
+        core_pairs: list[tuple[int, int]] = []
+        cir_records: list[ScheduledBlock | tuple[int, int]] = []
+        for record, (a, b) in zip(records, canonical):
+            if retained[a] < threshold and retained[b] < threshold:
+                core_pairs.append((a, b))
+                retained[a] += 1
+                retained[b] += 1
+            else:
+                cir_records.append(record)
+        cir = compile_schedule(geometry, cir_records)
+        core_peak = max(retained, default=0) * core_block_cycles
+        h0_peak = max(
+            ((len(q) + h0_mvm_count - 1) // h0_mvm_count) * h0_block_cycles
+            for q in cir.h0
+        ) if cir.h0 else 0
+        h1_peak = max(
+            ((len(q) + h1_mvm_count - 1) // h1_mvm_count) * h1_block_cycles
+            for q in cir.h1
+        ) if cir.h1 else 0
+        cross_peak = max(
+            ((len(q) + cross_mvm_count - 1) // cross_mvm_count)
+            * cross_block_cycles for q in cir.cross
+        ) if cir.cross else 0
+        objective = max(core_peak, h0_peak, h1_peak, cross_peak)
+        score = (objective, -len(core_pairs), threshold)
+        if best is None or score < best[0]:
+            best = (score, core_pairs, cir_records, cir)
+
+    assert best is not None
+    score, core_pairs, cir_records, cir = best
+    core = compile_cores_only_schedule(geometry, core_pairs)
+    return HybridSchedule(
+        geometry, core, cir, tuple(core_pairs),
+        tuple(_pair_tuple(record) for record in cir_records), score[0],
+    )
+
+
+def compile_cores_only_schedule(
+    geometry: Geometry,
+    pairs: Iterable[ScheduledBlock | tuple[int, int]],
+) -> CoresOnlySchedule:
+    """Expand symmetric blocks into two destination-side computations."""
+
+    total_h0 = geometry.node_count * geometry.h0_per_h1
+    h0 = [deque() for _ in range(total_h0)]
+    publications: set[tuple[int, int]] = set()
+    observed: set[tuple[int, int]] = set()
+    for record in pairs:
+        if isinstance(record, ScheduledBlock):
+            block_a, block_b = record.block_a, record.block_b
+        else:
+            block_a, block_b = record
+        pair = (block_a, block_b)
+        if not (0 <= block_a < block_b < geometry.total_blocks):
+            raise ValueError(f"invalid scheduled block pair {pair}")
+        if pair in observed:
+            raise ValueError(f"duplicate scheduled block pair {pair}")
+        observed.add(pair)
+        for destination, source in ((block_a, block_b), (block_b, block_a)):
+            destination_h0 = destination // geometry.cores_per_h0
+            h0[destination_h0].append(WorkItem(destination, source))
+            source_h1 = source // geometry.blocks_per_h1
+            destination_h1 = destination // geometry.blocks_per_h1
+            if source_h1 != destination_h1:
+                publications.add((source, destination_h1))
+    return CoresOnlySchedule(geometry, h0, tuple(sorted(publications)))
 
 
 def compile_schedule(

@@ -367,6 +367,10 @@ class SpinCore:
         old_state = self.core_state
         old_state_next = before.state_next
 
+        if self.core_state == self.IDLE and iter_start:
+            self.coeff_a_reg = signed(coeff_a, self.config.coefficient_width)
+            self.coeff_b_reg = signed(coeff_b, self.config.coefficient_width)
+
         # The MVM and SRAM sample the same pre-edge signals as core.sv.
         self.local_mvm.tick(
             start=local_start,
