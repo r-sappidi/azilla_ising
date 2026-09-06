@@ -11,6 +11,15 @@ from azilla_cycle_model.workload import Geometry, IsingDataset, ScheduledBlock
 
 
 class EventCompressionTests(unittest.TestCase):
+    def test_multi_engine_latency_and_issue_interval_are_distinct(self):
+        queues = [[object() for _ in range(5)]]
+        self.assertEqual(
+            EventCompressedPerformanceModel._resource_completions(
+                queues, engines=4, latency=67, issue_interval=40,
+            ),
+            [67, 67, 67, 67, 107],
+        )
+
     def test_event_loop_counts_skipped_time(self):
         loop = EventLoop()
         observed = []

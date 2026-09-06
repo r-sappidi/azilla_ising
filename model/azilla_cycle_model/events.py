@@ -9,6 +9,7 @@ the full cycle model.
 from __future__ import annotations
 
 import heapq
+import math
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
@@ -245,18 +246,32 @@ class EventTimingProfile:
     """RTL-derived endpoint constants for timing-only event scheduling.
 
     ``block_cycles`` is command-to-final-partial availability for an otherwise
-    idle engine/memory frontend.  Queueing on an engine and NoC contention are
-    computed, not folded into the constant.
+    idle engine/memory frontend. ``issue_interval_cycles`` captures overlap
+    between engines at a shared endpoint. The two fixed memory rates model
+    low-MLP and saturated service; they are applied to the aggregate request
+    stream at each H0 rather than independently to every spin core.
     """
 
     h0_block_cycles: int = 67
     h1_block_cycles: int = 67
     cross_block_cycles: int = 67
+    h0_issue_interval_cycles: int = 40
+    h1_issue_interval_cycles: int = 40
+    cross_issue_interval_cycles: int = 40
+    # Queued-v2 constants use fixed service abstractions, not a workload lookup.
+    # The saturated rate was fitted with uniform-d16/65K cores-only and the
+    # low-MLP rate with toroidal-d4/131K cores-only. Community, the second
+    # uniform size, and the other toroidal sizes are held out by
+    # scripts/check_calibrated_model_accuracy.py.
+    memory_fixed_latency_cycles: int = 30
+    memory_saturation_requests: int = 32768
+    memory_cold_requests_per_cycle: float = 7.8
+    memory_requests_per_cycle: float = 14.85
     init_fixed_cycles: int = 3
     init_cycles_per_block: int = 33
     iteration_control_cycles: int = 3
     post_compute_cycles: int = 9
-    calibrated_name: str = "rtl-g256-ramulator-128x32"
+    calibrated_name: str = "rtl-vcs-ramulator-128x32-queued-v2"
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +290,20 @@ class EventPerformanceConfig:
             raise ValueError("chiplet link latency must be non-negative")
         if self.execution_mode not in {"cir", CORES_ONLY, HYBRID}:
             raise ValueError(f"unknown execution mode {self.execution_mode!r}")
+        profile = self.profile
+        if any(value <= 0 for value in (
+            profile.h0_issue_interval_cycles,
+            profile.h1_issue_interval_cycles,
+            profile.cross_issue_interval_cycles,
+            profile.memory_cold_requests_per_cycle,
+            profile.memory_requests_per_cycle,
+        )):
+            raise ValueError("timing issue intervals and memory rate must be positive")
+        if (profile.memory_fixed_latency_cycles < 0 or
+                profile.memory_saturation_requests < 0):
+            raise ValueError(
+                "memory latency and saturation threshold must be non-negative"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -399,20 +428,34 @@ class EventCompressedPerformanceModel:
             )
 
     @staticmethod
-    def _resource_completions(queues, engines: int, duration: int) -> list[int]:
+    def _resource_completions(
+        queues, engines: int, latency: int, issue_interval: int,
+    ) -> list[int]:
         completions: list[int] = []
+        # The single-engine RTL differential has no inter-engine pipeline to
+        # overlap and therefore retires at the full measured latency.  The
+        # shorter calibrated initiation interval represents overlap exposed
+        # only by a multi-engine endpoint.
+        effective_interval = latency if engines == 1 else issue_interval
         for queue in queues:
             available = [0] * engines
             heapq.heapify(available)
             for _ in queue:
                 start = heapq.heappop(available)
-                completion = start + duration
-                heapq.heappush(available, completion)
+                completion = start + latency
+                heapq.heappush(available, start + effective_interval)
                 completions.append(completion)
         return completions
 
     def _cores_only_completions(self, queues, duration: int) -> list[int]:
-        """Completion times with work pinned to its destination spin core."""
+        """Core retirement plus the shared H0 memory-service lower bound.
+
+        The cores remain destination-stationary, but their weight requests do
+        not receive independent memory systems.  Every H0 shares one endpoint.
+        Model that endpoint with fixed latency plus low-load and saturated
+        request rates; this preserves finite bandwidth without replaying DRAM
+        commands.
+        """
 
         completions: list[int] = []
         for global_h0, queue in enumerate(queues):
@@ -422,6 +465,22 @@ class EventCompressedPerformanceModel:
                 core = work.block_a - base
                 available[core] += duration
                 completions.append(available[core])
+            if queue:
+                request_count = len(queue) * 32
+                cold_requests = min(
+                    request_count,
+                    self.config.profile.memory_saturation_requests,
+                )
+                saturated_requests = request_count - cold_requests
+                completions.append(
+                    self.config.profile.memory_fixed_latency_cycles
+                    + math.ceil(
+                        cold_requests
+                        / self.config.profile.memory_cold_requests_per_cycle
+                        + saturated_requests
+                        / self.config.profile.memory_requests_per_cycle
+                    )
+                )
         return completions
 
     def run(self, *, schedule: list[ScheduledBlock] | None = None,
@@ -530,17 +589,20 @@ class EventCompressedPerformanceModel:
             self._cores_only_completions(h0_queues, profile.h0_block_cycles)
             if core_schedule is not None else
             self._resource_completions(
-                h0_queues, h0_engines, profile.h0_block_cycles
+                h0_queues, h0_engines, profile.h0_block_cycles,
+                profile.h0_issue_interval_cycles,
             )
         )
         if hybrid is not None:
             h0_done.extend(self._resource_completions(
                 compiled.h0, self.config.h0_mvm_count,
                 profile.h0_block_cycles,
+                profile.h0_issue_interval_cycles,
             ))
         h1_done = self._resource_completions(
             ([] for _ in compiled.h1) if cores_only is not None else compiled.h1,
-            self.config.h1_mvm_count, profile.h1_block_cycles
+            self.config.h1_mvm_count, profile.h1_block_cycles,
+            profile.h1_issue_interval_cycles,
         )
         cross_done: list[tuple[int, int, int]] = []
         for owner, queue in enumerate(
@@ -548,10 +610,17 @@ class EventCompressedPerformanceModel:
         ):
             available = [0] * self.config.cross_mvm_count
             heapq.heapify(available)
+            cross_interval = (
+                profile.cross_block_cycles
+                if self.config.cross_mvm_count == 1
+                else profile.cross_issue_interval_cycles
+            )
             for work in queue:
                 start = heapq.heappop(available)
                 completion = start + profile.cross_block_cycles
-                heapq.heappush(available, completion)
+                heapq.heappush(
+                    available, start + cross_interval
+                )
                 cross_done.append((completion, owner, work.block_a))
                 cross_done.append((completion, owner, work.block_b))
 
@@ -781,6 +850,20 @@ class EventCompressedPerformanceModel:
                 maximum = max(jobs_by_core.values(), default=0)
             else:
                 maximum = (jobs + engines - 1) // engines
+            nominal_service = maximum * profile.h0_block_cycles
+            if core_schedule is not None and jobs:
+                cold = min(jobs * 32, profile.memory_saturation_requests)
+                saturated = jobs * 32 - cold
+                memory_service = profile.memory_fixed_latency_cycles + math.ceil(
+                    cold / profile.memory_cold_requests_per_cycle
+                    + saturated / profile.memory_requests_per_cycle
+                )
+                nominal_service = max(nominal_service, memory_service)
+            elif jobs and engines > 1:
+                nominal_service = (
+                    profile.h0_block_cycles
+                    + (maximum - 1) * profile.h0_issue_interval_cycles
+                )
             work_resources.append(EventWorkResourceStats(
                 "h0",
                 global_h0 // self.geometry.h0_per_h1,
@@ -789,7 +872,7 @@ class EventCompressedPerformanceModel:
                 jobs,
                 maximum,
                 profile.h0_block_cycles,
-                maximum * profile.h0_block_cycles,
+                nominal_service,
                 jobs * 32,
             ))
         if hybrid is not None:
@@ -801,15 +884,17 @@ class EventCompressedPerformanceModel:
                     "h0-cir", global_h0 // self.geometry.h0_per_h1,
                     global_h0 % self.geometry.h0_per_h1, engines, jobs,
                     maximum, profile.h0_block_cycles,
-                    maximum * profile.h0_block_cycles, jobs * 32,
+                    (0 if maximum == 0 else profile.h0_block_cycles
+                     + (maximum - 1) * profile.h0_issue_interval_cycles),
+                    jobs * 32,
                 ))
         hierarchy_resources = () if cores_only is not None else (
             ("h1", compiled.h1, self.config.h1_mvm_count,
-             profile.h1_block_cycles),
+             profile.h1_block_cycles, profile.h1_issue_interval_cycles),
             ("cross", compiled.cross, self.config.cross_mvm_count,
-             profile.cross_block_cycles),
+             profile.cross_block_cycles, profile.cross_issue_interval_cycles),
         )
-        for level, queues, engines, duration in hierarchy_resources:
+        for level, queues, engines, duration, interval in hierarchy_resources:
             for node, queue in enumerate(queues):
                 jobs = len(queue)
                 maximum = (jobs + engines - 1) // engines
@@ -821,7 +906,8 @@ class EventCompressedPerformanceModel:
                     jobs,
                     maximum,
                     duration,
-                    maximum * duration,
+                    (0 if maximum == 0 else duration + (maximum - 1)
+                     * (duration if engines == 1 else interval)),
                     jobs * 32,
                 ))
         result_counts = (

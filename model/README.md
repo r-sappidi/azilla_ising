@@ -179,9 +179,28 @@ limitations in reported results.
 The event model removes spin/MVM arithmetic and schedules endpoint completion
 events. Empty NoC intervals are jumped over but remain in the reported cycle
 count; every active or contended NoC cycle uses the same RTL-differentially
-checked Python router. The default endpoint profile is calibrated to the
-128-pin/32-Gb/s Ramulator configuration. Override its block-cycle parameters
-only with measurements from the exact model or RTL.
+checked Python router. The queued-v2 endpoint profile separates job latency
+from multi-engine initiation interval and applies fixed low-load/saturated
+request rates to the one shared memory endpoint per H0. This avoids granting
+each destination core an independent memory interface. Its constants are
+calibrated to the 128-pin/32-Gb/s Ramulator configuration and are recorded in
+every summary. Override them only using a documented training/held-out
+comparison against exact-event or RTL results.
+
+Calibration accuracy must be evaluated on points not used to select the
+profile constants. For example:
+
+```bash
+python3 scripts/check_calibrated_model_accuracy.py \
+  --calibrated results/calibration/cores/summary.csv \
+  --calibrated results/calibration/cir/summary.csv \
+  --exact-root results/exact_execution_modes \
+  --output results/calibration/accuracy.json
+```
+
+The checker defaults to a 10% held-out mean-error limit and a 20% held-out
+maximum-error limit. Passing this check supports use as a calibrated screening
+model; it does not change the result label to `rtl-differential`.
 
 The CLI labels results `rtl-differential` only for a configuration actually
 covered by an end-to-end RTL comparison. Other geometries are labeled
