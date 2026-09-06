@@ -37,6 +37,7 @@ class HierarchyOutputs:
 
 class _Engine:
     IDLE = "IDLE"
+    FETCH = "FETCH"
     START = "START"
     COMPUTE = "COMPUTE"
     OUTPUT_IDLE = "OUTPUT_IDLE"
@@ -68,6 +69,12 @@ class _Engine:
         self.result_b = [[[0] * count for _ in range(2)]][0]
         self.result_blocks: list[tuple[int, int]] = [(0, 0), (0, 0)]
         self.partial_beat = 0
+        self.state_a = 0
+        self.state_b = 0
+        self.state_a_valid = False
+        self.state_b_valid = False
+        self.state_a_pending = False
+        self.state_b_pending = False
         self.mvm.reset()
         self.sram.reset()
 
@@ -115,18 +122,27 @@ class HierarchyNode:
         *,
         config: ArchitectureConfig | None = None,
         timing_only: bool = False,
+        state_bank_count: int | None = None,
     ):
         if state_entry_count <= 0 or mvm_count <= 0:
             raise ValueError("state and engine counts must be positive")
+        resolved_bank_count = (config.state_bank_count if config is not None
+                               else 8) if state_bank_count is None else state_bank_count
+        if (resolved_bank_count <= 0 or
+                resolved_bank_count & (resolved_bank_count - 1)):
+            raise ValueError("state_bank_count must be a positive power of two")
         self.config = config or ArchitectureConfig()
         self.timing_only = timing_only
         self.state_mem = [0] * state_entry_count
+        self.state_bank_count = resolved_bank_count
+        self._state_responses: list[tuple[int, int]] = []
         self.engines = [_Engine(self.config, timing_only) for _ in range(mvm_count)]
         self.reset()
 
     def reset(self) -> None:
         self.node_state = self.RESET
         self.schedule_done_pending = False
+        self._state_responses = []
         for engine in self.engines:
             engine.reset()
 
@@ -167,6 +183,9 @@ class HierarchyNode:
                 for index in range(2)
             ]
             if any(engine.slot_valid) and not all(result_busy):
+                return engine.FETCH
+        elif engine.state == engine.FETCH:
+            if engine.state_a_valid and engine.state_b_valid:
                 return engine.START
         elif engine.state == engine.START:
             return engine.COMPUTE
@@ -226,6 +245,35 @@ class HierarchyNode:
             for index, engine in enumerate(self.engines)
         ]
 
+        # The RTL state banks return accepted reads after one cycle. Responses
+        # are latched at this edge, so FETCH can advance on the following edge.
+        old_state_responses = self._state_responses
+        next_state_responses: list[tuple[int, int]] = []
+        used_banks: set[int] = set()
+        for lane in range(2 * count):
+            engine = self.engines[lane // 2]
+            operand_b = bool(lane & 1)
+            valid = engine.state == engine.FETCH and (
+                not engine.state_b_valid and not engine.state_b_pending
+                if operand_b else
+                not engine.state_a_valid and not engine.state_a_pending
+            )
+            if not valid:
+                continue
+            command = engine.slot_commands[engine.active_slot]
+            if command is None:
+                raise RuntimeError("state fetch has no command metadata")
+            state_index = command.state_b_index if operand_b else command.state_a_index
+            bank = state_index % self.state_bank_count
+            if bank in used_banks:
+                continue
+            used_banks.add(bank)
+            next_state_responses.append((lane, self.state_mem[state_index]))
+            if operand_b:
+                engine.state_b_pending = True
+            else:
+                engine.state_a_pending = True
+
         self.node_state = node_next
         if state_valid and before.state_ready:
             self.state_mem[state_index] = unsigned(state_data, self.config.spin_count)
@@ -252,17 +300,10 @@ class HierarchyNode:
             command_accepted = commands[index] is not None and before.command_ready[index]
             weight_accepted = weight_valid[index] and before.weight_ready[index]
 
-            state_a = 0
-            state_b = 0
-            command_for_active = engine.slot_commands[old_active_slot]
-            if not self.timing_only and command_for_active is not None:
-                state_a = self.state_mem[command_for_active.state_a_index]
-                state_b = self.state_mem[command_for_active.state_b_index]
-
             engine.mvm.tick(
                 start=old_state == engine.START,
-                state_a=state_a,
-                state_b=state_b,
+                state_a=engine.state_a,
+                state_b=engine.state_b,
                 weight_data=old_read_data,
             )
             if not self.timing_only:
@@ -293,7 +334,7 @@ class HierarchyNode:
                 else:
                     engine.weight_beat = old_weight_beat + 1
 
-            if old_state == engine.IDLE and engine_next[index] == engine.START:
+            if old_state == engine.IDLE and engine_next[index] == engine.FETCH:
                 selected_j = 0 if engine.slot_valid[0] else 1
                 selected_result = int(
                     engine.result_valid[0] or engine.result_reserved[0]
@@ -307,6 +348,10 @@ class HierarchyNode:
                 engine.result_blocks[selected_result] = (
                     command.block_a, command.block_b
                 )
+                engine.state_a_valid = False
+                engine.state_b_valid = False
+                engine.state_a_pending = False
+                engine.state_b_pending = False
 
             if old_state == engine.COMPUTE and old_done:
                 if not self.timing_only:
@@ -331,5 +376,17 @@ class HierarchyNode:
             if (old_output_state == engine.SEND_B and accepted[index] and
                     old_partial_beat == self.config.partial_beats - 1):
                 engine.result_valid[old_result_read_slot] = False
+
+        for lane, data in old_state_responses:
+            engine = self.engines[lane // 2]
+            if lane & 1:
+                engine.state_b = data
+                engine.state_b_valid = True
+                engine.state_b_pending = False
+            else:
+                engine.state_a = data
+                engine.state_a_valid = True
+                engine.state_a_pending = False
+        self._state_responses = next_state_responses
 
         return before

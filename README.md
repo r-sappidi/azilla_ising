@@ -115,6 +115,20 @@ PYTHONPATH=model python -m azilla_cycle_model.cli simulate-exact-events \
 The certified smoke case reports 267 initialization cycles, 179 iteration
 cycles, and 446 total cycles with `accuracy=rtl-differential`.
 
+For the VCS-only representative cores-only validation envelope, including
+directed arithmetic, real-router backpressure, live Ramulator replay, and
+capacity elaboration through 256K spins, run:
+
+```bash
+scripts/run_core_only_rtl_scale_check.sh
+scripts/run_cores_only_representative_vcs.sh
+```
+
+This is compositional validation, not a claim that every large geometry was
+directly RTL-differentially verified. See [tb/README.md](tb/README.md) and
+[model/README.md](model/README.md#cir-and-cores-only-execution-modes) for the
+coverage boundary and required result labels.
+
 ## Mapping experiments
 
 See [MAPPING_EXPERIMENTS.md](MAPPING_EXPERIMENTS.md) for the mapper artifact

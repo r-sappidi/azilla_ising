@@ -81,6 +81,22 @@ subsystem checks; they do not establish full-mesh cores-only timing at larger
 geometries. The Python execution-mode commands and their validation scope are
 documented in `model/README.md`.
 
+The paper's VCS-only representative cores-only validation is reproducible as:
+
+```bash
+scripts/run_core_only_rtl_scale_check.sh
+scripts/run_cores_only_representative_vcs.sh
+```
+
+It combines directed-core arithmetic/accounting, a two-endpoint real-FlooNoC
+exchange across three seeds and three backpressure levels, deterministic live
+Ramulator endpoint replay, and VCS capacity elaboration through 256K spins.
+The generated manifest records that the router/core and Ramulator endpoint are
+compositional subchecks; larger exact-event results remain projections from
+this representative validation envelope. Set `VCS_HOME` if `vcs` is not on
+`PATH`; `CC`, `CXX`, `OUTPUT_ROOT`, and `CAPACITY_ROOT` may be overridden for
+the local toolchain and artifact layout.
+
 `ITERATION_COUNT` sizes the compiled epoch fields and sets the default run
 length. A binary compiled for a larger maximum can select any positive run
 length up to that maximum at launch with `SIM_ARGS=+ITERATIONS=<count>`. For

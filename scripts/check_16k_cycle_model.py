@@ -195,7 +195,31 @@ def main() -> None:
         "--reuse-rtl-trace", action="store_true",
         help="use an already generated RTL event trace instead of rerunning RTL",
     )
+    parser.add_argument(
+        "--reused-rtl-initialization-cycles", type=int, default=16_899,
+        help="initialization cycles recorded by the reused RTL run",
+    )
+    parser.add_argument(
+        "--reused-rtl-total-cycles", type=int, default=18_829,
+        help="total cycles recorded by the reused RTL run",
+    )
     args = parser.parse_args()
+
+    rtl_path = ROOT / args.rtl
+    rtl_sources = [
+        ROOT / "rtl/hierarchy_node.sv",
+        ROOT / "rtl/banked_state_sram.sv",
+        ROOT / "rtl/ising_mesh.sv",
+        ROOT / "tb/ising_mesh_tb.sv",
+    ]
+    if not rtl_path.is_file():
+        raise FileNotFoundError(f"missing RTL binary: {rtl_path}")
+    newest_source = max(path.stat().st_mtime for path in rtl_sources)
+    if rtl_path.stat().st_mtime < newest_source:
+        raise RuntimeError(
+            f"stale RTL binary: {rtl_path}; rebuild the 16K FlooNoC "
+            "configuration before running the differential"
+        )
 
     geometry = Geometry(4, 4, 2, 16)
     dataset = IsingDataset.load(ROOT / args.dataset)
@@ -206,6 +230,15 @@ def main() -> None:
     rtl_output = ""
     trace_path = ROOT / args.rtl_event_trace
     stats_path = ROOT / args.rtl_stats
+    if args.reuse_rtl_trace:
+        for artifact in (trace_path, stats_path):
+            if not artifact.is_file():
+                raise FileNotFoundError(f"missing reused RTL artifact: {artifact}")
+            if artifact.stat().st_mtime < rtl_path.stat().st_mtime:
+                raise RuntimeError(
+                    f"stale reused RTL artifact: {artifact}; regenerate it "
+                    "with the current binary"
+                )
     if not args.reuse_rtl_trace:
         env = dict(os.environ)
         ramulator_dir = str(ROOT / "third_party/ramulator2")
@@ -264,7 +297,10 @@ def main() -> None:
         raise AssertionError(f"NoC totals mismatch RTL={rtl_noc} Python={python_noc}")
 
     if args.reuse_rtl_trace:
-        rtl_timing = (16_899, 18_720)
+        rtl_timing = (
+            args.reused_rtl_initialization_cycles,
+            args.reused_rtl_total_cycles,
+        )
         if rtl_timing != (result.initialization_cycles, result.total_cycles):
             raise AssertionError(
                 f"timing mismatch RTL={rtl_timing} Python="

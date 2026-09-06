@@ -13,6 +13,7 @@ class ArchitectureConfig:
     accumulator_width: int = 32
     coefficient_width: int = 16
     router_fifo_depth: int = 4
+    state_bank_count: int = 8
 
     def __post_init__(self) -> None:
         if self.spin_count <= 0:
@@ -27,6 +28,9 @@ class ArchitectureConfig:
             )
         if self.router_fifo_depth < 2:
             raise ValueError("FlooNoC optimal FIFO requires depth >= 2")
+        if (self.state_bank_count <= 0 or
+                self.state_bank_count & (self.state_bank_count - 1)):
+            raise ValueError("state_bank_count must be a positive power of two")
 
     @property
     def partial_lanes(self) -> int:
@@ -39,4 +43,3 @@ class ArchitectureConfig:
     @property
     def weight_beats(self) -> int:
         return self.spin_count
-

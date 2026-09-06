@@ -50,7 +50,7 @@ class MetricsTests(unittest.TestCase):
         self.assertFalse(
             RamulatorEventPerformanceModel._advance_cores_only_core(slots)
         )
-        self.assertEqual(prefetched_tail["compute"], 31)
+        self.assertEqual(prefetched_tail["compute"], 66)
 
     def test_exact_metrics_export(self):
         resource = NocResourceStats(

@@ -168,10 +168,13 @@ update equation.
 
 Calibrated results are screening estimates. Exact-event mode retains live
 Ramulator timing but is timing-only and does not by itself verify arithmetic.
-The current strict CIR trace differential covers the documented small and 16K
-configurations. Cores-only has unit/component RTL coverage, but a full-system
-64K RTL differential has not yet completed. Preserve the CLI accuracy label in
-reported results.
+The strict CIR trace differential covers the documented small and 16K
+configurations. The VCS-only cores-only validation combines an integrated
+two-endpoint real-router/directed-core differential, live Ramulator endpoint
+checks, and capacity elaboration through 256K. It is a representative,
+compositional validation envelope rather than a direct large-geometry RTL
+differential. Preserve the CLI accuracy label and the validation-manifest
+limitations in reported results.
 
 The event model removes spin/MVM arithmetic and schedules endpoint completion
 events. Empty NoC intervals are jumped over but remain in the reported cycle

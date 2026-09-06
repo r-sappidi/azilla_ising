@@ -121,30 +121,36 @@ def main() -> None:
     parser.add_argument(
         "--ramulator-config", default="tb/ramulator_128x32.yaml"
     )
+    parser.add_argument("--only-16k", action="store_true")
+    parser.add_argument(
+        "--trace-16k", default="build/full_cycle_model_16k_rtl_events.csv"
+    )
     args = parser.parse_args()
     library = ROOT / args.ramulator_library
     config = ROOT / args.ramulator_config
 
-    check_case(
-        name="g256",
-        geometry=Geometry(2, 1, 2, 2),
-        dataset_path=ROOT / "tb/datasets/g256_smoke.txt",
-        trace_path=ROOT / "build/trace256_rtl_events.csv",
-        expected_timing=(267, 179, 446),
-        expected_noc=(22, 22, 10, 1, 3, 0),
-        h0_mvms=1,
-        h1_mvms=1,
-        cross_mvms=1,
-        library=library,
-        ramulator_config=config,
-    )
+    if not args.only_16k:
+        check_case(
+            name="g256",
+            geometry=Geometry(2, 1, 2, 2),
+            dataset_path=ROOT / "tb/datasets/g256_smoke.txt",
+            trace_path=ROOT / "build/trace256_rtl_events.csv",
+            expected_timing=(267, 179, 446),
+            expected_noc=(22, 22, 10, 1, 3, 0),
+            h0_mvms=1,
+            h1_mvms=1,
+            cross_mvms=1,
+            library=library,
+            ramulator_config=config,
+        )
     check_case(
         name="g16384",
         geometry=Geometry(4, 4, 2, 16),
         dataset_path=ROOT / "tb/datasets/g16384_kings.txt",
-        trace_path=ROOT / "build/full_cycle_model_16k_rtl_events.csv",
-        expected_timing=(16_899, 1_821, 18_720),
-        expected_noc=(1_336, 1_336, 2_200, 122, 131, 215),
+        trace_path=ROOT / args.trace_16k,
+        # Fresh post-banked-state RTL differential, regenerated 2026-09-06.
+        expected_timing=(16_899, 1_930, 18_829),
+        expected_noc=(1_336, 1_336, 2_200, 123, 116, 215),
         h0_mvms=1,
         h1_mvms=1,
         cross_mvms=16,

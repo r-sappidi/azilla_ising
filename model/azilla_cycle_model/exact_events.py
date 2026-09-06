@@ -589,7 +589,13 @@ class RamulatorEventPerformanceModel:
 
         state = slots[0]
         if int(state["received"]) == 32 and int(state["compute"]) < 0:
-            state["compute"] = 32
+            # A Ramulator response fills the streamer's reassembly buffer; it
+            # does not write the core-local SRAM directly.  The synthesizable
+            # path then needs 32 row handshakes to load that SRAM followed by
+            # the row-serial MVM/result handshake.  The measured RTL latency
+            # from an available buffered block to retirement is 67 cycles
+            # (also the calibrated model's h0_block_cycles default).
+            state["compute"] = 67
         remaining = int(state["compute"])
         if remaining <= 0:
             return False

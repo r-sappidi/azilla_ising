@@ -55,7 +55,7 @@ static-hybrid-256-test:
 	mkdir -p ../build/static_hybrid_256_tb
 	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
 		--top-module static_hybrid_256_tb --Mdir build/static_hybrid_256_tb \
-		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv rtl/mvm.sv \
 		rtl/symmetric_mvm.sv rtl/hierarchy_node.sv \
 		rtl/core_local_mvm_engine.sv tb/static_hybrid_256_tb.sv
 	../build/static_hybrid_256_tb/Vstatic_hybrid_256_tb
@@ -66,7 +66,7 @@ static-hybrid-256-vcs-test:
 		export VCS_HOME=$${VCS_HOME:-/home/hwpeng/vcs} && \
 		$$VCS_HOME/bin/vcs -full64 -sverilog -timescale=1ns/1ps \
 		-LDFLAGS '-no-pie' -top static_hybrid_256_tb \
-		../../rtl/ising_pkg.sv ../../rtl/j_block_sram.sv ../../rtl/mvm.sv \
+		../../rtl/ising_pkg.sv ../../rtl/j_block_sram.sv ../../rtl/banked_state_sram.sv ../../rtl/mvm.sv \
 		../../rtl/symmetric_mvm.sv ../../rtl/hierarchy_node.sv \
 		../../rtl/core_local_mvm_engine.sv ../../tb/static_hybrid_256_tb.sv \
 		-o simv && ./simv
@@ -97,7 +97,7 @@ cycle-model-compute-trace-build:
 	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
 		--top-module cycle_model_compute_trace_tb \
 		--Mdir build/cycle_model_compute_trace_tb \
-		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/symmetric_mvm.sv \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv rtl/symmetric_mvm.sv \
 		tb/cycle_model_compute_trace_tb.sv
 
 cycle-model-spin-core-trace-build:
@@ -113,7 +113,7 @@ cycle-model-hierarchy-trace-build:
 	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
 		--top-module cycle_model_hierarchy_trace_tb \
 		--Mdir build/cycle_model_hierarchy_trace_tb \
-		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/symmetric_mvm.sv \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv rtl/symmetric_mvm.sv \
 		rtl/hierarchy_node.sv tb/cycle_model_hierarchy_trace_tb.sv
 
 cycle-model-router-trace-build:
@@ -248,7 +248,7 @@ ramulator-node-perf-test:
 		-GMAX_OUTSTANDING=$(PERF_MAX_OUTSTANDING) \
 		-CFLAGS "-std=c++20 -I$(abspath $(RAMULATOR_DIR))/src" \
 		-LDFLAGS "-L$(abspath $(RAMULATOR_DIR)) -lramulator -Wl,-rpath,$(abspath $(RAMULATOR_DIR))" \
-		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/mvm.sv rtl/symmetric_mvm.sv \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv rtl/mvm.sv rtl/symmetric_mvm.sv \
 		rtl/hierarchy_node.sv rtl/dram_weight_streamer.sv \
 		tb/ramulator_dpi_bridge.sv tb/ramulator_node_frontend.sv \
 		tb/ramulator_node_perf_tb.sv $(abspath ramulator_dpi.cpp)
@@ -262,6 +262,7 @@ $(FLOO_BUILD_DIR)/Vising_mesh_tb: \
 	$(RTL_DIR)/floo_router_files.f \
 	$(RTL_DIR)/ising_pkg.sv \
 	$(RTL_DIR)/j_block_sram.sv \
+	$(RTL_DIR)/banked_state_sram.sv \
 	$(RTL_DIR)/mvm.sv \
 	$(RTL_DIR)/symmetric_mvm.sv \
 	$(RTL_DIR)/core.sv \
@@ -307,7 +308,7 @@ $(FLOO_BUILD_DIR)/Vising_mesh_tb: \
 		-CFLAGS "-std=c++20 -I$(abspath $(RAMULATOR_DIR))/src" \
 		-LDFLAGS "-L$(abspath $(RAMULATOR_DIR)) -lramulator -Wl,-rpath,$(abspath $(RAMULATOR_DIR))" \
 		-f rtl/floo_router_files.f \
-		rtl/ising_pkg.sv rtl/j_block_sram.sv \
+		rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv \
 		rtl/mvm.sv rtl/symmetric_mvm.sv \
 		rtl/core.sv rtl/hierarchy_node.sv \
 		rtl/h0_adapter.sv rtl/h0_tile.sv \

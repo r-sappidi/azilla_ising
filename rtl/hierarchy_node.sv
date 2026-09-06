@@ -26,6 +26,7 @@ import ising_pkg::*;
 // every J slot, MVM, and result slot to have drained.
 module hierarchy_node #(
     parameter int STATE_ENTRY_COUNT = 32,
+    parameter int STATE_BANK_COUNT  = 8,
     parameter int MVM_COUNT         = 16,
     parameter int GLOBAL_BLOCK_ID_W = 16
 ) (
@@ -92,8 +93,9 @@ module hierarchy_node #(
         NODE_DONE
     } node_state_t;
 
-    typedef enum logic [1:0] {
+    typedef enum logic [2:0] {
         ENGINE_IDLE,
+        ENGINE_FETCH,
         ENGINE_START,
         ENGINE_COMPUTE
     } engine_state_t;
@@ -125,9 +127,6 @@ module hierarchy_node #(
     logic [GLOBAL_BLOCK_ID_W-1:0] engine_slot_block_a [0:MVM_COUNT-1][0:1];
     logic [GLOBAL_BLOCK_ID_W-1:0] engine_slot_block_b [0:MVM_COUNT-1][0:1];
 
-    // Frozen state table populated before each iteration.
-    logic [SPIN_COUNT-1:0] state_mem [0:STATE_ENTRY_COUNT-1];
-
     logic engine_load_active [0:MVM_COUNT-1];
     logic engine_load_slot [0:MVM_COUNT-1];
     logic [WEIGHT_BEAT_W-1:0] engine_weight_beat [0:MVM_COUNT-1];
@@ -142,6 +141,15 @@ module hierarchy_node #(
 
     logic [SPIN_COUNT-1:0] engine_state_a [0:MVM_COUNT-1];
     logic [SPIN_COUNT-1:0] engine_state_b [0:MVM_COUNT-1];
+    logic [MVM_COUNT-1:0] engine_state_a_valid;
+    logic [MVM_COUNT-1:0] engine_state_b_valid;
+    logic [MVM_COUNT-1:0] engine_state_a_pending;
+    logic [MVM_COUNT-1:0] engine_state_b_pending;
+    logic [2*MVM_COUNT-1:0] state_request_valid;
+    logic [2*MVM_COUNT-1:0] state_request_ready;
+    logic [2*MVM_COUNT-1:0][STATE_INDEX_W-1:0] state_request_index;
+    logic [2*MVM_COUNT-1:0] state_response_valid;
+    logic [2*MVM_COUNT-1:0][SPIN_COUNT-1:0] state_response_data;
     logic [WEIGHT_BEAT_W-1:0] engine_read_row [0:MVM_COUNT-1];
     logic [WEIGHT_W*SPIN_COUNT-1:0] engine_read_data [0:MVM_COUNT-1];
     logic [MVM_COUNT-1:0] engine_weight_write_enable;
@@ -180,23 +188,50 @@ module hierarchy_node #(
     assign iter_done = node_state == NODE_DONE;
     assign state_ready_o = node_state != NODE_RUN;
 
+    banked_state_sram #(
+        .STATE_ENTRY_COUNT(STATE_ENTRY_COUNT),
+        .STATE_W(SPIN_COUNT),
+        .STATE_BANK_COUNT(STATE_BANK_COUNT),
+        .REQUEST_COUNT(2*MVM_COUNT)
+    ) state_storage (
+        .clk,
+        .rst,
+        .write_valid_i(state_valid_i && state_ready_o),
+        .write_index_i(state_index_i),
+        .write_data_i(state_data_i),
+        .request_valid_i(state_request_valid),
+        .request_ready_o(state_request_ready),
+        .request_index_i(state_request_index),
+        .response_valid_o(state_response_valid),
+        .response_data_o(state_response_data)
+    );
+
+    always_comb begin
+        state_request_valid = '0;
+        state_request_index = '0;
+        for (int engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin
+            state_request_valid[2*engine_index] =
+                engine_state[engine_index] == ENGINE_FETCH &&
+                !engine_state_a_valid[engine_index] &&
+                !engine_state_a_pending[engine_index];
+            state_request_valid[2*engine_index+1] =
+                engine_state[engine_index] == ENGINE_FETCH &&
+                !engine_state_b_valid[engine_index] &&
+                !engine_state_b_pending[engine_index];
+            state_request_index[2*engine_index] =
+                engine_slot_state_a_index[engine_index]
+                    [engine_active_slot[engine_index]];
+            state_request_index[2*engine_index+1] =
+                engine_slot_state_b_index[engine_index]
+                    [engine_active_slot[engine_index]];
+        end
+    end
+
     // ---------------------------------------------------------------------
     // MVM instances
     // ---------------------------------------------------------------------
     generate
         for (genvar engine_index = 0; engine_index < MVM_COUNT; engine_index++) begin : gen_engines
-            // Select the two frozen source vectors. The J storage below has a
-            // synchronous row read and never stores a transpose.
-            always_comb begin
-                engine_state_a[engine_index] =
-                    state_mem
-                        [engine_slot_state_a_index[engine_index][engine_active_slot[engine_index]]];
-                engine_state_b[engine_index] =
-                    state_mem
-                        [engine_slot_state_b_index[engine_index][engine_active_slot[engine_index]]];
-
-            end
-
             j_block_sram #(
                 .ROW_COUNT(SPIN_COUNT),
                 .ROW_W(SPIN_COUNT*WEIGHT_W)
@@ -338,6 +373,11 @@ module hierarchy_node #(
                     if (engine_slot_valid[engine_index] != 2'b00 &&
                         (engine_result_slot_valid[engine_index] |
                          engine_result_slot_reserved[engine_index]) != 2'b11)
+                        engine_state_n[engine_index] = ENGINE_FETCH;
+                end
+                ENGINE_FETCH: begin
+                    if (engine_state_a_valid[engine_index] &&
+                        engine_state_b_valid[engine_index])
                         engine_state_n[engine_index] = ENGINE_START;
                 end
                 ENGINE_START: begin
@@ -382,9 +422,6 @@ module hierarchy_node #(
         else begin
             node_state <= node_state_n;
 
-            if (state_valid_i && state_ready_o)
-                state_mem[state_index_i] <= state_data_i;
-
             if (iter_start) begin
                 schedule_done_pending <= 1'b0;
             end
@@ -414,6 +451,12 @@ module hierarchy_node #(
                     engine_result_write_slot[engine_index] <= 1'b0;
                     engine_result_read_slot[engine_index] <= 1'b0;
                     engine_partial_beat[engine_index] <= '0;
+                    engine_state_a[engine_index] <= '0;
+                    engine_state_b[engine_index] <= '0;
+                    engine_state_a_valid[engine_index] <= 1'b0;
+                    engine_state_b_valid[engine_index] <= 1'b0;
+                    engine_state_a_pending[engine_index] <= 1'b0;
+                    engine_state_b_pending[engine_index] <= 1'b0;
                     engine_slot_state_a_index[engine_index] <= '{default: '0};
                     engine_slot_state_b_index[engine_index] <= '{default: '0};
                     engine_slot_block_a[engine_index] <= '{default: '0};
@@ -468,7 +511,7 @@ module hierarchy_node #(
                     // Select a completed slot before issuing the MVM start
                     // pulse on the following cycle.
                     if (engine_state[engine_index] == ENGINE_IDLE &&
-                        engine_state_n[engine_index] == ENGINE_START) begin
+                        engine_state_n[engine_index] == ENGINE_FETCH) begin
                         logic selected_j_slot;
                         logic selected_result_slot;
 
@@ -492,6 +535,30 @@ module hierarchy_node #(
                         engine_result_block_b[engine_index]
                             [selected_result_slot] <=
                                 engine_slot_block_b[engine_index][selected_j_slot];
+                        engine_state_a_valid[engine_index] <= 1'b0;
+                        engine_state_b_valid[engine_index] <= 1'b0;
+                        engine_state_a_pending[engine_index] <= 1'b0;
+                        engine_state_b_pending[engine_index] <= 1'b0;
+                    end
+
+                    if (state_request_valid[2*engine_index] &&
+                        state_request_ready[2*engine_index])
+                        engine_state_a_pending[engine_index] <= 1'b1;
+                    if (state_request_valid[2*engine_index+1] &&
+                        state_request_ready[2*engine_index+1])
+                        engine_state_b_pending[engine_index] <= 1'b1;
+
+                    if (state_response_valid[2*engine_index]) begin
+                        engine_state_a[engine_index] <=
+                            state_response_data[2*engine_index];
+                        engine_state_a_valid[engine_index] <= 1'b1;
+                        engine_state_a_pending[engine_index] <= 1'b0;
+                    end
+                    if (state_response_valid[2*engine_index+1]) begin
+                        engine_state_b[engine_index] <=
+                            state_response_data[2*engine_index+1];
+                        engine_state_b_valid[engine_index] <= 1'b1;
+                        engine_state_b_pending[engine_index] <= 1'b0;
                     end
 
                     // Copy completed arithmetic into its reserved result slot.

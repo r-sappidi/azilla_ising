@@ -5,6 +5,26 @@ from azilla_cycle_model.hierarchy import DmaCommand, HierarchyNode
 
 
 class HierarchyNodeTests(unittest.TestCase):
+    def test_state_bank_conflicts_serialize_in_lane_order(self):
+        node = HierarchyNode(state_entry_count=32, mvm_count=2,
+                             state_bank_count=8)
+        node.node_state = node.RUN
+        for engine_index, engine in enumerate(node.engines):
+            engine.state = engine.FETCH
+            engine.slot_commands[0] = DmaCommand(
+                8 * (2 * engine_index), 8 * (2 * engine_index + 1), 0, 1
+            )
+
+        # All four operands map to bank zero. The fixed-priority SRAM arbiter
+        # therefore accepts one lane per cycle rather than inventing read
+        # ports or duplicating the state table.
+        accepted_lanes = []
+        for _ in range(4):
+            node.tick()
+            self.assertEqual(len(node._state_responses), 1)
+            accepted_lanes.append(node._state_responses[0][0])
+        self.assertEqual(accepted_lanes, [0, 1, 2, 3])
+
     def test_one_block_pipeline_and_serialization(self):
         node = HierarchyNode(state_entry_count=2, mvm_count=1)
         node.tick(rst=True)
