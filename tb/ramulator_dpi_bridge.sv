@@ -37,6 +37,11 @@ module ramulator_dpi_bridge #(
     // Calls occur on the falling edge so ready/valid values are stable for the
     // following rising-edge RTL transfer.
     always @(negedge clk) begin
+        // The testbench advances all Ramulator systems in a separate negedge
+        // process.  Move bridge transactions to the inactive region so the
+        // global tick deterministically occurs first; otherwise VCS may order
+        // tick and send/pop differently when several engines are active.
+        #0;
         if (rst) begin
             req_ready_o = '0;
             rsp_valid_o = '0;

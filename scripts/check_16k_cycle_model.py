@@ -176,6 +176,9 @@ def main() -> None:
                  "f4_s1_r1_i1_t1/Vising_mesh_tb"),
     )
     parser.add_argument("--dataset", default="tb/datasets/g16384_kings.txt")
+    parser.add_argument("--h0-mvms", type=int, default=1)
+    parser.add_argument("--h1-mvms", type=int, default=1)
+    parser.add_argument("--cross-mvms", type=int, default=16)
     parser.add_argument(
         "--ramulator-library",
         default="build/cycle_model_ramulator/libazilla_ramulator.so",
@@ -247,7 +250,7 @@ def main() -> None:
         )
         completed = subprocess.run(
             [
-                str(ROOT / args.rtl), "+DATASET=g16384_kings.txt",
+                str(ROOT / args.rtl), f"+DATASET={Path(args.dataset).name}",
                 f"+NOC_STATS_FILE={stats_path}",
                 f"+NOC_EVENT_FILE={trace_path}",
             ],
@@ -265,7 +268,9 @@ def main() -> None:
         dataset_path=str(ROOT / args.dataset),
         mem_lanes=16, ticks_per_cycle=40,
         config=PerformanceConfig(
-            h0_mvm_count=1, h1_mvm_count=1, cross_mvm_count=16,
+            h0_mvm_count=args.h0_mvms,
+            h1_mvm_count=args.h1_mvms,
+            cross_mvm_count=args.cross_mvms,
             fifo_depth=4, timing_only=True, max_cycles=25_000,
         ),
     )

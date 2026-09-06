@@ -493,6 +493,11 @@ class DirectPerformanceModel:
             quiet = 0 if active else quiet + 1
 
         pending = set(range(self.geometry.node_count))
+        # Match the RTL testbench's publish_completion task: entering the task
+        # consumes one falling edge before done_publish_valid_i is asserted.
+        # This cycle is architecturally visible in the full-system trace even
+        # though no completion flit is offered during it.
+        self._tick(epochs=epochs)
         while pending:
             destinations = [None] * self.geometry.node_count
             accepted = []
