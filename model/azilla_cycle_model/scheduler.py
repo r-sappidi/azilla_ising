@@ -196,6 +196,28 @@ def compile_hybrid_schedule(
     )
 
 
+def compile_locality_hybrid_schedule(
+    geometry: Geometry,
+    pairs: Iterable[ScheduledBlock | tuple[int, int]],
+) -> HybridSchedule:
+    """Keep same-H0 interactions in CIR and execute all others at cores.
+
+    The policy depends only on the immutable placement geometry.  It avoids
+    the provision-limited H1 and cross-H1 CIR pools without using workload
+    profiling, measured timing, or runtime availability signals.
+    """
+
+    records = list(pairs)
+    core_pairs = [
+        _pair_tuple(record) for record in records
+        if (_pair_tuple(record)[0] // geometry.cores_per_h0 !=
+            _pair_tuple(record)[1] // geometry.cores_per_h0)
+    ]
+    return compile_hybrid_schedule(
+        geometry, records, core_pairs=core_pairs,
+    )
+
+
 def _pair_tuple(record: ScheduledBlock | tuple[int, int]) -> tuple[int, int]:
     if isinstance(record, ScheduledBlock):
         return record.block_a, record.block_b

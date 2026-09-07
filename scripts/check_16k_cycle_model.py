@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+from collections import deque
+from collections import Counter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +40,95 @@ class TracedRamulatorModel(RamulatorPerformanceModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.transfers: list[Transfer] = []
+        self.ejection_observations: list[tuple[int, int, int, int, int]] = []
+        self.expected_by_cycle: dict[int, list[Transfer]] | None = None
+        self.internal_first: dict[tuple[str, int, int, str], int] = {}
+        self.internal_recent = deque(maxlen=512)
+        self.expected_internal_by_cycle: dict[int, Counter] | None = None
+
+    def _observe_internal(self, epochs) -> None:
+        """Record first pre-edge hierarchy handshakes for phase diagnosis."""
+        cycle = self.counters.cycles
+        # Initialization dominates this check and has no hierarchy work.
+        if cycle < 17_170:
+            return
+        for target, frontend in self.frontends.items():
+            stream = frontend.streamer.outputs()
+            if target.level == "h0":
+                tile = self.system.h1_tiles[target.node].outputs()
+                command_ready = tile.h0_command_ready[target.index]
+                weight_ready = tile.h0_weight_ready[target.index]
+            elif target.level == "h1":
+                tile = self.system.h1_tiles[target.node].outputs()
+                command_ready = tile.h1_command_ready
+                weight_ready = tile.h1_weight_ready
+            else:
+                cross = self.system.cross_nodes[target.node].outputs(
+                    0 if epochs is None else epochs[target.node]
+                )
+                command_ready = cross.command_ready
+                weight_ready = cross.weight_ready
+            for engine, output in enumerate(stream.node):
+                if output.command_valid and command_ready[engine]:
+                    self.internal_recent.append(
+                        (cycle, target.level, target.node, engine, "command")
+                    )
+                    self.internal_first.setdefault(
+                        (target.level, target.node, engine, "command"), cycle
+                    )
+                if output.weight_valid and weight_ready[engine]:
+                    self.internal_recent.append(
+                        (cycle, target.level, target.node, engine, "weight")
+                    )
+                    self.internal_first.setdefault(
+                        (target.level, target.node, engine, "weight"), cycle
+                    )
+
+        if self.expected_internal_by_cycle is not None:
+            observed = Counter()
+            for target, frontend in self.frontends.items():
+                stream = frontend.streamer.outputs()
+                if target.level == "h0":
+                    tile = self.system.h1_tiles[target.node].outputs()
+                    command_ready = tile.h0_command_ready[target.index]
+                    weight_ready = tile.h0_weight_ready[target.index]
+                elif target.level == "h1":
+                    tile = self.system.h1_tiles[target.node].outputs()
+                    command_ready = tile.h1_command_ready
+                    weight_ready = tile.h1_weight_ready
+                else:
+                    cross = self.system.cross_nodes[target.node].outputs(
+                        0 if epochs is None else epochs[target.node]
+                    )
+                    command_ready = cross.command_ready
+                    weight_ready = cross.weight_ready
+                observed[(target.node, target.level, target.index, "command")] += sum(
+                    out.command_valid and command_ready[engine]
+                    for engine, out in enumerate(stream.node)
+                )
+                observed[(target.node, target.level, target.index, "weight")] += sum(
+                    out.weight_valid and weight_ready[engine]
+                    for engine, out in enumerate(stream.node)
+                )
+            observed = Counter({key: value for key, value in observed.items() if value})
+            expected = self.expected_internal_by_cycle.get(cycle, Counter())
+            if observed != expected:
+                raise AssertionError(
+                    f"online internal divergence at cycle {cycle}: "
+                    f"RTL={dict(expected)!r} Python={dict(observed)!r}"
+                )
+
+    def _tick(self, *args, **kwargs):
+        if not kwargs.get("rst", False):
+            self._observe_internal(kwargs.get("epochs"))
+        try:
+            return super()._tick(*args, **kwargs)
+        except AssertionError as error:
+            raise AssertionError(
+                f"{error}; Python internal first handshakes="
+                f"{sorted(self.internal_first.items())!r}; recent="
+                f"{list(self.internal_recent)!r}"
+            ) from error
 
     @staticmethod
     def _transfer(cycle: int, scope: str, node: int, direction: str,
@@ -50,6 +141,7 @@ class TracedRamulatorModel(RamulatorPerformanceModel):
     def _record_noc(self, h1_inputs, cross_inputs, state_publications,
                     done_destinations) -> None:
         cycle = self.counters.cycles
+        first_transfer = len(self.transfers)
         comb = [router.outputs() for router in self.system.mesh.routers]
         epochs = [cross_inputs[node].get("epoch", 0)
                   for node in range(self.geometry.node_count)]
@@ -75,6 +167,9 @@ class TracedRamulatorModel(RamulatorPerformanceModel):
                     ).state_ready
                     if rx.packet_type == NOC_STATE else adapter.rx_ready
                 )
+                self.ejection_observations.append((
+                    cycle, node, rx.packet_type, rx.block_id, int(ready)
+                ))
                 if ready:
                     self.transfers.append(
                         self._transfer(cycle, "eject", node, "local", rx)
@@ -116,6 +211,15 @@ class TracedRamulatorModel(RamulatorPerformanceModel):
                     self._transfer(cycle, "inject", node, "local", selected)
                 )
 
+        if self.expected_by_cycle is not None:
+            observed = sorted(self.transfers[first_transfer:])
+            expected = sorted(self.expected_by_cycle.get(cycle, ()))
+            if observed != expected:
+                raise AssertionError(
+                    f"online NoC divergence at cycle {cycle}: "
+                    f"RTL={expected!r} Python={observed!r}"
+                )
+
         super()._record_noc(
             h1_inputs, cross_inputs, state_publications, done_destinations
         )
@@ -154,6 +258,22 @@ def rtl_noc_totals(path: Path) -> tuple[int, int, int, int, int, int]:
     )
 
 
+def rtl_internal_memory_transfers(path: Path) -> dict[int, Counter]:
+    result: dict[int, Counter] = {}
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            if row["event"] != "accept" or row["transfer"] not in ("command", "weight"):
+                continue
+            key = (
+                int(row["node"]), row["endpoint_class"],
+                int(row["endpoint_id"]), row["transfer"],
+            )
+            result.setdefault(int(row["cycle"]), Counter())[key] += int(
+                row["accepted_lanes"]
+            )
+    return result
+
+
 def canonical(events: list[Transfer]) -> list[Transfer]:
     # RTL monitors nodes and scopes in a different loop order than the passive
     # Python observer. Transfers on the same edge are simultaneous, so order
@@ -179,6 +299,7 @@ def main() -> None:
     parser.add_argument("--h0-mvms", type=int, default=1)
     parser.add_argument("--h1-mvms", type=int, default=1)
     parser.add_argument("--cross-mvms", type=int, default=16)
+    parser.add_argument("--max-cycles", type=int, default=100_000)
     parser.add_argument(
         "--ramulator-library",
         default="build/cycle_model_ramulator/libazilla_ramulator.so",
@@ -197,6 +318,14 @@ def main() -> None:
     parser.add_argument(
         "--reuse-rtl-trace", action="store_true",
         help="use an already generated RTL event trace instead of rerunning RTL",
+    )
+    parser.add_argument(
+        "--online-cycle-check", action="store_true",
+        help="stop immediately at the first accepted-transfer cycle mismatch",
+    )
+    parser.add_argument(
+        "--rtl-internal-event-trace",
+        help="also stop at the first command/weight boundary mismatch",
     )
     parser.add_argument(
         "--reused-rtl-initialization-cycles", type=int, default=16_899,
@@ -271,9 +400,18 @@ def main() -> None:
             h0_mvm_count=args.h0_mvms,
             h1_mvm_count=args.h1_mvms,
             cross_mvm_count=args.cross_mvms,
-            fifo_depth=4, timing_only=True, max_cycles=25_000,
+            fifo_depth=4, timing_only=True, max_cycles=args.max_cycles,
         ),
     )
+    if args.online_cycle_check:
+        expected_by_cycle: dict[int, list[Transfer]] = {}
+        for transfer in rtl_transfers(trace_path):
+            expected_by_cycle.setdefault(transfer[0], []).append(transfer)
+        model.expected_by_cycle = expected_by_cycle
+    if args.rtl_internal_event_trace:
+        model.expected_internal_by_cycle = rtl_internal_memory_transfers(
+            ROOT / args.rtl_internal_event_trace
+        )
     try:
         result = model.run(schedule=schedule, sparse=True)
     finally:
@@ -291,6 +429,14 @@ def main() -> None:
             "source_id", "epoch", "block_id", "dest_x", "dest_y", "last",
         ))
         writer.writerows(observed)
+
+    stall_trace_path = python_trace_path.with_name(
+        python_trace_path.stem + "_ejection_offers.csv"
+    )
+    with stall_trace_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("cycle", "node", "packet_type", "block_id", "ready"))
+        writer.writerows(model.ejection_observations)
 
     rtl_noc = rtl_noc_totals(stats_path)
     python_noc = (

@@ -185,17 +185,18 @@ ENGINE_STATE_NUMBER = {"IDLE": 0, "FETCH": 1, "START": 2, "COMPUTE": 3}
 OUTPUT_STATE_NUMBER = {"OUTPUT_IDLE": 0, "SEND_A": 1, "SEND_B": 2}
 
 
-def _hierarchy_record(cycle: int, node: HierarchyNode) -> tuple[int, ...]:
+def _hierarchy_record(cycle: int, engine_index: int,
+                      node: HierarchyNode) -> tuple[int, ...]:
     outputs = node.outputs()
-    engine = node.engines[0]
-    partial = outputs.partials[0]
+    engine = node.engines[engine_index]
+    partial = outputs.partials[engine_index]
     slot_bits = int(engine.slot_valid[0]) | (int(engine.slot_valid[1]) << 1)
     result_bits = int(engine.result_valid[0]) | (int(engine.result_valid[1]) << 1)
     reserved_bits = int(engine.result_reserved[0]) | (int(engine.result_reserved[1]) << 1)
     return (
-        cycle, NODE_STATE_NUMBER[node.node_state], int(outputs.iter_done),
-        int(outputs.state_ready), int(outputs.command_ready[0]),
-        int(outputs.weight_ready[0]), int(partial.valid), partial.block_id,
+        cycle, engine_index, NODE_STATE_NUMBER[node.node_state], int(outputs.iter_done),
+        int(outputs.state_ready), int(outputs.command_ready[engine_index]),
+        int(outputs.weight_ready[engine_index]), int(partial.valid), partial.block_id,
         int(partial.last), partial.data,
         ENGINE_STATE_NUMBER[engine.state], OUTPUT_STATE_NUMBER[engine.output_state],
         slot_bits, result_bits, reserved_bits, engine.partial_beat,
@@ -203,14 +204,14 @@ def _hierarchy_record(cycle: int, node: HierarchyNode) -> tuple[int, ...]:
 
 
 def python_hierarchy_trace() -> list[tuple[int, ...]]:
-    node = HierarchyNode(state_entry_count=2, mvm_count=1)
+    node = HierarchyNode(state_entry_count=2, mvm_count=2)
     trace: list[tuple[int, ...]] = []
     cycle = 0
 
     def step(**signals: object) -> None:
         nonlocal cycle
         node.tick(**signals)
-        trace.append(_hierarchy_record(cycle, node))
+        trace.extend(_hierarchy_record(cycle, engine, node) for engine in range(2))
         cycle += 1
 
     step(rst=True)
@@ -219,14 +220,22 @@ def python_hierarchy_trace() -> list[tuple[int, ...]]:
     step(state_valid=True, state_index=0, state_data=0xFFFFFFFF)
     step(state_valid=True, state_index=1, state_data=0)
     step(iter_start=True)
-    step(commands=[DmaCommand(0, 1, 10, 20)])
-    for row in range(32):
-        values = [1 if row == column else 0 for column in range(32)]
-        step(weight_valid=[True], weight_data=[pack_lanes(values, 8)],
-             partial_ready=[True])
-    step(schedule_done=True, partial_ready=[True])
+    step(commands=[DmaCommand(0, 1, 10, 20), DmaCommand(0, 1, 11, 21)])
+    for engine in range(2):
+        for row in range(32):
+            values = [1 if row == column else 0 for column in range(32)]
+            word = pack_lanes(values, 8)
+            while not node.outputs().weight_ready[engine]:
+                step(partial_ready=[True, True])
+            valid = [False, False]
+            data = [0, 0]
+            valid[engine] = True
+            data[engine] = word
+            step(weight_valid=valid, weight_data=data,
+                 partial_ready=[True, True])
+    step(schedule_done=True, partial_ready=[True, True])
     while not node.outputs().iter_done:
-        step(partial_ready=[True])
+        step(partial_ready=[True, True])
     return trace
 
 
@@ -246,7 +255,7 @@ def rtl_hierarchy_trace(build: bool) -> list[tuple[int, ...]]:
         fields = line.split()
         if fields[:1] == ["HN"]:
             payload = fields[1:]
-            values = [int(field, 16) if index == 9 else int(field)
+            values = [int(field, 16) if index == 10 else int(field)
                       for index, field in enumerate(payload)]
             trace.append(tuple(values))
     if not trace:

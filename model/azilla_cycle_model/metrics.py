@@ -89,6 +89,7 @@ def write_exact_event_metrics(
             "logical_weight_blocks_stored": result.logical_weight_blocks_stored,
             "remote_state_packets": result.remote_state_packets,
             "core_weight_buffers": result.core_weight_buffers,
+            "pipeline_contract": result.core_pipeline_contract,
             "top_level_partial_packets": counters.type_flits[1] // 4,
         },
         "effective_mvm_engines": effective_mvm_engines,

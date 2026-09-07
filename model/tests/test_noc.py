@@ -6,6 +6,13 @@ from azilla_cycle_model.noc import (
 
 
 class RouterTests(unittest.TestCase):
+    def test_sparse_request_priority_matches_floo_binary_tree(self):
+        # Independently checked against cc_rr_arb_tree in VCS. A rotating
+        # linear encoder disagrees when the priority requester disappears.
+        self.assertEqual(FlooRouter._select_rr([0, 2], 1), 0)
+        self.assertEqual(FlooRouter._select_rr([2, 3], 1), 3)
+        self.assertEqual(FlooRouter._select_rr([1, 4], 2), 1)
+
     def test_input_fifo_adds_one_cycle(self):
         router = FlooRouter(0, 0, fifo_depth=4)
         flit = Flit(dest_x=0, dest_y=0)

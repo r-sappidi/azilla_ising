@@ -91,6 +91,7 @@ module core_only_representative_vcs_tb;
     always_comb begin
         in_valid='0;in_data='0;in_type='0;in_dx='0;in_dy='0;
         in_source='0;in_epoch='0;in_block='0;in_last='1;
+        weight_valid='0; weight_data='0;
         for(int n=0;n<NODES;n++) begin
             out_ready[n]='1;
             in_valid[n][LOCAL]=inject_valid[n];in_data[n][LOCAL]=inject_data[n];
@@ -98,6 +99,11 @@ module core_only_representative_vcs_tb;
             in_dy[n][LOCAL]=inject_dy[n];in_source[n][LOCAL]=inject_source[n];
             in_epoch[n][LOCAL]=inject_epoch[n];in_block[n][LOCAL]=inject_block[n];
             in_last[n][LOCAL]=inject_last[n];
+            if(out_valid[n][LOCAL] && out_type[n][LOCAL]==2'd3) begin
+                weight_valid[n]=1'b1;
+                weight_data[n]=out_data[n][LOCAL];
+                out_ready[n][LOCAL]=weight_ready[n];
+            end
         end
         in_valid[0][EAST]=out_valid[1][WEST];
         in_data[0][EAST]=out_data[1][WEST];in_type[0][EAST]=out_type[1][WEST];
@@ -123,7 +129,8 @@ module core_only_representative_vcs_tb;
       end else begin
         cycle_count <= cycle_count+1;
         for(int n=0;n<NODES;n++) begin
-            if(out_valid[n][LOCAL]&&out_ready[n][LOCAL]) begin
+            if(out_valid[n][LOCAL]&&out_ready[n][LOCAL] &&
+               out_type[n][LOCAL]==2'd0) begin
                 received_state[n] <= out_data[n][LOCAL][SPIN_COUNT-1:0];
                 $display("CORE_REP_EVENT cycle=%0d event=eject node=%0d block=%0d",
                          cycle_count,n,out_block[n][LOCAL]);
@@ -144,13 +151,32 @@ module core_only_representative_vcs_tb;
       end
     end
 
+    // The cross-H1 memory owner is node zero. Stream one canonical 1-KiB
+    // block copy through the real router to each destination core. The second
+    // endpoint consumes the transposed row order locally, as required for the
+    // reverse directed product of a symmetric interaction block.
+    task automatic send_weight_packet(input int destination);
+        for(int row=0;row<SPIN_COUNT;row++) begin
+            inject_valid[0]=1'b1; inject_type[0]=2'd3;
+            inject_dx[0]=destination; inject_dy[0]=0;
+            inject_source[0]=0; inject_epoch[0]=1;
+            inject_block[0]=destination; inject_last[0]=(row==SPIN_COUNT-1);
+            for(int col=0;col<SPIN_COUNT;col++)
+                inject_data[0][col*WEIGHT_W+:WEIGHT_W]=
+                    weight(destination,1-destination,row,col);
+            do @(posedge clk); while(!in_ready[0][LOCAL]);
+            @(negedge clk);
+        end
+        inject_valid[0]=1'b0; inject_data[0]='0; inject_last[0]=1'b1;
+    endtask
+
     initial begin
         void'($value$plusargs("STALL_CYCLES=%d",stall_cycles));
         void'($value$plusargs("SEED=%d",seed));
         inject_valid='0;inject_data='0;inject_type='0;inject_dx='0;inject_dy='0;
         inject_source='0;inject_epoch='0;inject_block='0;inject_last='1;
-        job_valid='0;weight_valid='0;
-        result_ready='0;source_id='0;source_state='0;weight_data='0;
+        job_valid='0;
+        result_ready='0;source_id='0;source_state='0;
         for(int n=0;n<NODES;n++) for(int s=0;s<SPIN_COUNT;s++)
             states[n][s]=((n*7+s*3+seed)%5)<2;
         repeat(3) @(posedge clk); @(negedge clk); rst=0;
@@ -172,13 +198,12 @@ module core_only_representative_vcs_tb;
         end
         do @(posedge clk); while(!(job_ready[0]&&job_ready[1]));
         @(negedge clk);job_valid='0;
-        for(int row=0;row<SPIN_COUNT;row++) begin
-            for(int n=0;n<NODES;n++) for(int col=0;col<SPIN_COUNT;col++)
-                weight_data[n][col*WEIGHT_W+:WEIGHT_W]=weight(n,1-n,row,col);
-            weight_valid='1;do @(posedge clk);while(!(weight_ready[0]&&weight_ready[1]));
-            @(negedge clk);
-        end
-        weight_valid='0;wait(result_valid==2'b11);@(negedge clk);
+        // Both directed jobs read the same canonical cross-H1 memory owner;
+        // the complete weight block, rather than a computed partial, travels
+        // to each endpoint core.
+        send_weight_packet(0);
+        send_weight_packet(1);
+        wait(result_valid==2'b11);@(negedge clk);
         for(int n=0;n<NODES;n++) begin
             for(int row=0;row<SPIN_COUNT;row++) if(result[n][row]!==golden(n,row)) begin
                 $error("result mismatch node=%0d row=%0d rtl=%0d golden=%0d",
@@ -191,7 +216,7 @@ module core_only_representative_vcs_tb;
             state_bytes[n]!=4||remote_bytes[n]!=4) begin
             $error("counter mismatch node=%0d",n);errors++;
         end
-        if(injected!=2||ejected!=2||link_flits!=2) begin
+        if(injected!=66||ejected!=66||link_flits!=34) begin
             $error("traffic mismatch injected=%0d ejected=%0d links=%0d",
                    injected,ejected,link_flits);errors++;
         end

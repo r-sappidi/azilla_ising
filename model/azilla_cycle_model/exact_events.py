@@ -34,8 +34,8 @@ from .performance import PerformanceConfig, PerformanceCounters
 from .ramulator import RamulatorBackend
 from .scheduler import (
     CORES_ONLY, HYBRID, CROSS, H0, H1, ConcurrentDispatcher, DispatchPort,
-    WorkTarget, compile_cores_only_schedule, compile_static_hybrid_schedule,
-    compile_schedule,
+    WorkTarget, compile_cores_only_schedule, compile_hybrid_schedule,
+    compile_static_hybrid_schedule, compile_schedule,
 )
 from .workload import BlockOccupancyDataset, Geometry, IsingDataset, ScheduledBlock
 
@@ -159,6 +159,7 @@ class ExactEventResult:
     logical_weight_blocks_stored: int = 0
     remote_state_packets: int = 0
     core_weight_buffers: int = 0
+    core_pipeline_contract: dict = field(default_factory=dict)
 
 
 class RamulatorEventPerformanceModel:
@@ -606,13 +607,20 @@ class RamulatorEventPerformanceModel:
     def _run_cores_only(
         self, schedule_records: list[ScheduledBlock], initialization: int,
     ) -> ExactEventResult:
-        """Exact DRAM timing for destination-stationary core computation.
+        """Run the independently RTL-compared full single-MVM core controller."""
+        from .core_full_events import run_full_cores
+        return run_full_cores(self, schedule_records, initialization)
 
-        Each H0 retains one Ramulator system. Its cores independently serialize
-        their directed jobs, while all request streams contend at that shared
-        endpoint. A core starts arithmetic only after all 32 weights arrive;
-        arithmetic occupies that core for 32 cycles. Remote states are cached
-        once per source block and consuming H1 before computation starts.
+    def _run_cores_only_legacy_kernel(
+        self, schedule_records: list[ScheduledBlock], initialization: int,
+    ) -> ExactEventResult:
+        """Exact DRAM timing for the canonical-memory cores-only ablation.
+
+        Weight ownership is identical to CIR: H0-local, H1-local, and cross-H1
+        blocks are read through their native Ramulator systems.  Cores-only
+        changes only compute placement.  Each directed job reads the canonical
+        block and transports its 32 weight rows to the destination core; a
+        cross-H1 transport is a 32-flit packet on the modeled top-level NoC.
         """
 
         compiled = compile_cores_only_schedule(self.geometry, schedule_records)
@@ -661,85 +669,76 @@ class RamulatorEventPerformanceModel:
         compute_start = 2 + publication.elapsed_cycles + 2
         self.backend.tick((initialization + compute_start) * self.ticks_per_cycle)
 
-        # One FIFO per destination core.  Every H0 shares one memory system.
-        core_queues: list[list[deque]] = []
-        for global_h0, queue in enumerate(compiled.h0):
-            base = global_h0 * self.geometry.cores_per_h0
-            per_core = [deque() for _ in range(self.geometry.cores_per_h0)]
+        # Recover the single canonical memory owner used by the CIR schedule.
+        cir = compile_schedule(self.geometry, schedule_records)
+        total_h0 = self.geometry.node_count * self.geometry.h0_per_h1
+        owner_system: dict[tuple[int, int], tuple[int, str, int, int]] = {}
+        for global_h0, queue in enumerate(cir.h0):
             for work in queue:
-                per_core[work.block_a - base].append(work)
-            core_queues.append(per_core)
-        # Two slots per core mirror the CIR streamer's double buffering.  The
-        # tail may fetch while the head computes, but retirement remains FIFO.
-        active: dict[tuple[int, int], list[dict[str, object]]] = {}
-        next_tag = 1
-        tags: dict[int, dict[str, object]] = {}
-        cycle = 0
-        while True:
-            for global_h0, per_core in enumerate(core_queues):
-                for core, queue in enumerate(per_core):
-                    key = (global_h0, core)
-                    slots = active.setdefault(key, [])
-                    while len(slots) < 2 and queue:
-                        slots.append({
-                            "work": queue.popleft(), "sent": 0,
-                            "received": 0, "compute": -1,
-                        })
-                    if not slots:
-                        active.pop(key, None)
+                owner_system[(work.block_a, work.block_b)] = (
+                    global_h0, H0,
+                    global_h0 // self.geometry.h0_per_h1,
+                    global_h0 % self.geometry.h0_per_h1,
+                )
+        for node, queue in enumerate(cir.h1):
+            for work in queue:
+                owner_system[(work.block_a, work.block_b)] = (
+                    total_h0 + node, H1, node, 0,
+                )
+        for node, queue in enumerate(cir.cross):
+            for work in queue:
+                owner_system[(work.block_a, work.block_b)] = (
+                    total_h0 + self.geometry.node_count + node, CROSS, node, 0,
+                )
 
-            # Match the RTL frontend width: at most mem_lanes offers per H0
-            # and cycle. Rejected offers remain at the same beat for retry.
-            for global_h0 in range(len(core_queues)):
-                offers = 0
-                for core in range(self.geometry.cores_per_h0):
-                    if offers >= self.mem_lanes:
-                        break
-                    for state in active.get((global_h0, core), []):
-                        if offers >= self.mem_lanes:
-                            break
-                        beat = int(state["sent"])
-                        if beat >= 32:
-                            continue
-                        work = state["work"]
-                        address = (
-                            (work.block_a * self.geometry.total_blocks
-                             + work.block_b) * 1024
-                            + beat * 32
-                        )
-                        tag = next_tag
-                        offers += 1
-                        if self.backend.send(global_h0, address, tag):
-                            tags[tag] = state
-                            next_tag += 1
-                            state["sent"] = beat + 1
+        # Use the same frontend/arbiter/core/mesh kernel exercised by the
+        # representative VCS integration differential. The surrounding
+        # publication and iteration boundary still require separate coverage.
+        if chiplet_latency:
+            raise ValueError("cores-only integrated kernel does not yet support chiplet link delay")
+        from .core_pipeline import CoreMemoryPipeline
+        from .hierarchy import DmaCommand
+        system_count = total_h0 + 2 * self.geometry.node_count
+        queues = {system: [] for system in range(system_count)}
+        for record in schedule_records:
+            a, b = sorted((record.block_a, record.block_b))
+            system_id = owner_system[(a, b)][0]
+            queues[system_id].extend((
+                DmaCommand(a, b, a, b), DmaCommand(b, a, b, a),
+            ))
+        system_jobs = Counter({s: len(q) for s, q in queues.items()})
+        engines = {
+            s: (self.config.h0_mvm_count if s < total_h0 else
+                self.config.h1_mvm_count if s < total_h0 + self.geometry.node_count
+                else self.config.cross_mvm_count)
+            for s in queues
+        }
+        weight_counts = Counter()
 
-            self.backend.tick(self.ticks_per_cycle)
-            for global_h0 in range(len(core_queues)):
-                for _ in range(self.mem_lanes):
-                    response = self.backend.pop(global_h0)
-                    if response is None:
-                        break
-                    state = tags.pop(response.tag)
-                    state["received"] = int(state["received"]) + 1
+        def record_pipeline_noc(now, scope, node, direction, flit, accepted):
+            absolute = initialization + compute_start + now
+            self._observe_noc_resource(absolute, scope, node, direction, flit, accepted)
+            weight_counts[(scope, accepted)] += 1
+            if accepted:
+                self.transfers.append(self._transfer(absolute, scope, node, direction, flit))
 
-            completed = []
-            for key, slots in active.items():
-                if self._advance_cores_only_core(slots):
-                    completed.append(key)
-            for key in completed:
-                active[key].pop(0)
-                if not active[key]:
-                    del active[key]
-            cycle += 1
-            if cycle > self.config.max_cycles:
-                raise TimeoutError("cores-only exact-event simulation timed out")
-            if not active and all(
-                not queue for per_core in core_queues for queue in per_core
-            ) and not tags:
-                break
-
-        completion_start = cycle
+        pipeline = CoreMemoryPipeline(
+            self.geometry, self.backend, queues, engines,
+            ticks_per_cycle=self.ticks_per_cycle,
+            fifo_depth=self.config.fifo_depth,
+            interconnect=self.config.interconnect,
+            mem_lanes=self.mem_lanes,
+            observer=getattr(self, "core_event_observer", None),
+            noc_observer=record_pipeline_noc,
+        )
+        completion_start = pipeline.run(self.config.max_cycles)
+        self.core_pipeline_audit = pipeline.audit
+        weight_injected = weight_counts[("inject", True)]
+        weight_ejected = weight_counts[("eject", True)]
+        weight_links = weight_counts[("link", True)]
+        weight_injection_stalls = weight_counts[("inject", False)]
+        weight_ejection_stalls = weight_counts[("eject", False)]
+        weight_link_stalls = weight_counts[("link", False)]
         done_packets = [
             PacketRelease(
                 cycle=completion_start, source=node, destination=node,
@@ -752,7 +751,9 @@ class RamulatorEventPerformanceModel:
             self.config.fifo_depth, self.config.interconnect,
         ).replay(
             done_packets, start_cycle=completion_start, drain_cycles=4,
-            observer=observe, resource_observer=observe_resource,
+            observer=lambda c, s, n, d, f: self.transfers.append(
+                self._transfer(initialization + compute_start + c, s, n, d, f)
+            ), resource_observer=observe_resource,
         )
         counters.injected_flits += done.injected_flits
         counters.ejected_flits += done.ejected_flits
@@ -760,20 +761,38 @@ class RamulatorEventPerformanceModel:
         counters.injection_stalls += done.injection_stalls
         counters.link_stalls += done.link_stalls
         counters.type_flits[2] += done.injected_flits
+        counters.injected_flits += weight_injected
+        counters.ejected_flits += weight_ejected
+        counters.physical_link_flits += weight_links
+        counters.injection_stalls += weight_injection_stalls
+        counters.ejection_stalls += weight_ejection_stalls
+        counters.link_stalls += weight_link_stalls
+        counters.type_flits[3] += weight_injected
         iteration_cycles = compute_start + done.end_cycle + 9
         counters.cycles = iteration_cycles
 
         dram_rows = []
-        for global_h0, queue in enumerate(compiled.h0):
-            raw = self.backend.stats(global_h0)
-            expected = len(queue) * 32
-            self._validate_cores_only_dram(global_h0, expected, raw)
+        system_count = total_h0 + 2 * self.geometry.node_count
+        for system_id in range(system_count):
+            raw = self.backend.stats(system_id)
+            expected_jobs = system_jobs[system_id]
+            expected = expected_jobs * 32
+            self._validate_cores_only_dram(system_id, expected, raw)
+            if system_id < total_h0:
+                level, node, index = (
+                    H0, system_id // self.geometry.h0_per_h1,
+                    system_id % self.geometry.h0_per_h1,
+                )
+            elif system_id < total_h0 + self.geometry.node_count:
+                level, node, index = H1, system_id - total_h0, 0
+            else:
+                level, node, index = (
+                    CROSS, system_id - total_h0 - self.geometry.node_count, 0
+                )
             dram_rows.append(DramPerformanceStats(
-                system_id=global_h0, level=H0,
-                node=global_h0 // self.geometry.h0_per_h1,
-                index=global_h0 % self.geometry.h0_per_h1,
-                engines=self.geometry.cores_per_h0,
-                scheduled_jobs=len(queue), accepted_requests=raw.accepted,
+                system_id=system_id, level=level, node=node, index=index,
+                engines=engines[system_id],
+                scheduled_jobs=expected_jobs, accepted_requests=raw.accepted,
                 rejected_requests=raw.rejected,
                 completed_requests=raw.completed,
                 outstanding_requests=raw.outstanding,
@@ -824,13 +843,29 @@ class RamulatorEventPerformanceModel:
             unordered_interaction_blocks=len(schedule_records),
             directed_core_jobs=compiled.directed_jobs,
             weight_block_reads=compiled.directed_jobs,
-            logical_weight_blocks_stored=2 * len(schedule_records),
+            logical_weight_blocks_stored=len(schedule_records),
             remote_state_packets=len(compiled.state_publications),
-            core_weight_buffers=2,
+            core_weight_buffers=1,
+            core_pipeline_contract={
+                "version": "shared-streamer-core-mesh-v2",
+                "source_buffer_bytes": 1024,
+                "source_buffers_per_streamer_lane": 2,
+                "max_outstanding_requests_per_system": 64,
+                "destination_job_reservations_per_core": 1,
+                "destination_weight_sram_blocks_per_core": 1,
+                "local_source_bits_per_cycle": 256,
+                "destination_h0_bits_per_cycle": 256,
+                "source_buffer_release": "last_local_delivery_or_cross_injection_handshake",
+                "local_arbitration": "cross_priority_then_ascending_system_id",
+                "integrated_rtl_validated": False,
+                "representative_component_differential": "scripts/check_core_memory_integration.py",
+                **self.core_pipeline_audit,
+            },
         )
 
     def _run_hybrid(
         self, schedule_records: list[ScheduledBlock], initialization: int,
+        core_pairs: Iterable[tuple[int, int]] | None = None,
     ) -> ExactEventResult:
         """Run static hybrid work with shared H0 Ramulator contention.
 
@@ -841,11 +876,16 @@ class RamulatorEventPerformanceModel:
         the integrated RTL hybrid datapath.
         """
 
-        hybrid = compile_static_hybrid_schedule(
-            self.geometry, schedule_records,
-            h0_mvm_count=self.config.h0_mvm_count,
-            h1_mvm_count=self.config.h1_mvm_count,
-            cross_mvm_count=self.config.cross_mvm_count,
+        hybrid = (
+            compile_hybrid_schedule(
+                self.geometry, schedule_records, core_pairs=core_pairs,
+            ) if core_pairs is not None else
+            compile_static_hybrid_schedule(
+                self.geometry, schedule_records,
+                h0_mvm_count=self.config.h0_mvm_count,
+                h1_mvm_count=self.config.h1_mvm_count,
+                cross_mvm_count=self.config.cross_mvm_count,
+            )
         )
         cir, core = hybrid.cir, hybrid.core
         publications = tuple(sorted(
@@ -1064,6 +1104,7 @@ class RamulatorEventPerformanceModel:
         *,
         schedule: Iterable[ScheduledBlock] | None = None,
         sparse: bool = True,
+        hybrid_core_pairs: Iterable[tuple[int, int]] | None = None,
     ) -> ExactEventResult:
         self._reset_timing_state()
         self.transfers = []
@@ -1078,8 +1119,12 @@ class RamulatorEventPerformanceModel:
         initialization = 3 + self.geometry.total_blocks * 33
         if self.config.execution_mode == CORES_ONLY:
             return self._run_cores_only(schedule_records, initialization)
+        if hybrid_core_pairs is not None and self.config.execution_mode != HYBRID:
+            raise ValueError("an explicit hybrid partition requires hybrid mode")
         if self.config.execution_mode == HYBRID:
-            return self._run_hybrid(schedule_records, initialization)
+            return self._run_hybrid(
+                schedule_records, initialization, hybrid_core_pairs,
+            )
         compiled = compile_schedule(self.geometry, schedule_records)
         chiplet_latency = self.config.chiplet_link_latency_cycles
 
@@ -1109,17 +1154,23 @@ class RamulatorEventPerformanceModel:
                 scope, node, direction, flit, accepted,
             )
 
-        publication = EventCompressedMesh(
+        publication_mesh = EventCompressedMesh(
             self.geometry.mesh_x,
             self.geometry.mesh_y,
             self.config.fifo_depth,
             self.config.interconnect,
-        ).replay(
+        )
+        publication = publication_mesh.replay(
             publications,
             drain_cycles=4,
             observer=observe_publication,
             resource_observer=observe_publication_resource,
         )
+        # Router arbitration state survives the publication/compute boundary
+        # in RTL, even after all flits drain. Reusing the drained mesh retains
+        # its request snapshots and round-robin priorities.
+        self.mesh = publication_mesh.mesh
+        self.mesh.advance_idle(2)  # cross-node start and following empty edge
 
         counters = PerformanceCounters(
             injected_flits=publication.injected_flits,
@@ -1136,7 +1187,9 @@ class RamulatorEventPerformanceModel:
 
         # Ramulator is alive during initialization and publication in the RTL.
         # Advance that idle time in C++ without constructing/ticking spin cores.
-        idle_ticks = (initialization + compute_start) * self.ticks_per_cycle
+        # Cycle zero is the first rising edge after reset release and has no
+        # preceding active DRAM falling edge (see RamulatorPerformanceModel).
+        idle_ticks = (initialization + compute_start - 1) * self.ticks_per_cycle
         if self.idle_tick_modulus is not None:
             if self.idle_tick_modulus <= 0:
                 raise ValueError("idle_tick_modulus must be positive")

@@ -3,6 +3,7 @@
 import ising_pkg::*;
 
 module cycle_model_hierarchy_trace_tb;
+    localparam int MVM_COUNT = 2;
     logic clk = 1'b0;
     logic rst = 1'b1;
     logic iter_start = 1'b0;
@@ -12,21 +13,22 @@ module cycle_model_hierarchy_trace_tb;
     logic state_index = 1'b0;
     logic [SPIN_COUNT-1:0] state_data = '0;
     logic schedule_done = 1'b0;
-    logic [0:0] cmd_valid = '0;
-    logic [0:0] cmd_ready;
-    logic [0:0][0:0] state_a_index = '0;
-    logic [0:0][0:0] state_b_index = '0;
-    logic [0:0][15:0] block_a = '0;
-    logic [0:0][15:0] block_b = '0;
-    logic [0:0] weight_valid = '0;
-    logic [0:0] weight_ready;
-    logic [0:0][DATA_W-1:0] weight_data = '0;
-    logic [0:0] partial_valid;
-    logic [0:0] partial_ready = '1;
-    logic signed [0:0][DATA_W-1:0] partial_data;
-    logic [0:0][15:0] partial_block;
-    logic [0:0] partial_last;
+    logic [MVM_COUNT-1:0] cmd_valid = '0;
+    logic [MVM_COUNT-1:0] cmd_ready;
+    logic [MVM_COUNT-1:0][0:0] state_a_index = '0;
+    logic [MVM_COUNT-1:0][0:0] state_b_index = '0;
+    logic [MVM_COUNT-1:0][15:0] block_a = '0;
+    logic [MVM_COUNT-1:0][15:0] block_b = '0;
+    logic [MVM_COUNT-1:0] weight_valid = '0;
+    logic [MVM_COUNT-1:0] weight_ready;
+    logic [MVM_COUNT-1:0][DATA_W-1:0] weight_data = '0;
+    logic [MVM_COUNT-1:0] partial_valid;
+    logic [MVM_COUNT-1:0] partial_ready = '1;
+    logic signed [MVM_COUNT-1:0][DATA_W-1:0] partial_data;
+    logic [MVM_COUNT-1:0][15:0] partial_block;
+    logic [MVM_COUNT-1:0] partial_last;
     int trace_cycle = 0;
+    int accepted_weights [0:MVM_COUNT-1] = '{default: 0};
 
     always #5 clk = ~clk;
 
@@ -38,7 +40,7 @@ module cycle_model_hierarchy_trace_tb;
     endfunction
 
     hierarchy_node #(
-        .STATE_ENTRY_COUNT(2), .MVM_COUNT(1), .GLOBAL_BLOCK_ID_W(16)
+        .STATE_ENTRY_COUNT(2), .MVM_COUNT(MVM_COUNT), .GLOBAL_BLOCK_ID_W(16)
     ) dut (
         .clk, .rst, .iter_start, .iter_done,
         .state_valid_i(state_valid), .state_ready_o(state_ready),
@@ -58,14 +60,24 @@ module cycle_model_hierarchy_trace_tb;
     task automatic step_and_trace;
         @(posedge clk);
         @(negedge clk);
-        $display("HN %0d %0d %0d %0d %0d %0d %0d %0d %0d %064h %0d %0d %0d %0d %0d %0d",
-                 trace_cycle, dut.node_state, iter_done, state_ready,
-                 cmd_ready[0], weight_ready[0], partial_valid[0],
-                 partial_block[0], partial_last[0], partial_data[0],
-                 dut.engine_state[0], dut.output_state[0],
-                 dut.engine_slot_valid[0], dut.engine_result_slot_valid[0],
-                 dut.engine_result_slot_reserved[0], dut.engine_partial_beat[0]);
+        for (int engine = 0; engine < MVM_COUNT; engine++) begin
+            if (weight_valid[engine] && weight_ready[engine])
+                accepted_weights[engine]++;
+        end
+        for (int engine = 0; engine < MVM_COUNT; engine++)
+            $display("HN %0d %0d %0d %0d %0d %0d %0d %0d %0d %0d %064h %0d %0d %0d %0d %0d %0d",
+                     trace_cycle, engine, dut.node_state, iter_done, state_ready,
+                     cmd_ready[engine], weight_ready[engine], partial_valid[engine],
+                     partial_block[engine], partial_last[engine], partial_data[engine],
+                     dut.engine_state[engine], dut.output_state[engine],
+                     dut.engine_slot_valid[engine], dut.engine_result_slot_valid[engine],
+                     dut.engine_result_slot_reserved[engine], dut.engine_partial_beat[engine]);
         trace_cycle++;
+        if (trace_cycle == 512) begin
+            $display("WATCHDOG accepted_weights=%0d,%0d", accepted_weights[0],
+                     accepted_weights[1]);
+            $finish;
+        end
     endtask
 
     initial begin
@@ -87,20 +99,25 @@ module cycle_model_hierarchy_trace_tb;
         step_and_trace();
         iter_start = 1'b0;
 
-        cmd_valid[0] = 1'b1;
-        state_a_index[0] = 0;
-        state_b_index[0] = 1;
-        block_a[0] = 16'd10;
-        block_b[0] = 16'd20;
+        cmd_valid = '1;
+        state_a_index = '0;
+        state_b_index = '1;
+        block_a[0] = 16'd10; block_b[0] = 16'd20;
+        block_a[1] = 16'd11; block_b[1] = 16'd21;
         step_and_trace();
-        cmd_valid[0] = 1'b0;
+        cmd_valid = '0;
 
-        for (int row = 0; row < SPIN_COUNT; row++) begin
-            weight_valid[0] = 1'b1;
-            weight_data[0] = identity_row(row);
-            step_and_trace();
+        for (int engine = 0; engine < MVM_COUNT; engine++) begin
+            for (int row = 0; row < SPIN_COUNT; row++) begin
+                weight_valid = '0;
+                while (!weight_ready[engine])
+                    step_and_trace();
+                weight_valid[engine] = 1'b1;
+                weight_data[engine] = identity_row(row);
+                step_and_trace();
+            end
         end
-        weight_valid[0] = 1'b0;
+        weight_valid = '0;
         schedule_done = 1'b1;
         step_and_trace();
         schedule_done = 1'b0;

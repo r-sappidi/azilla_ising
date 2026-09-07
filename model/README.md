@@ -57,9 +57,23 @@ Audit the 16,384-spin Ramulator configuration with strict per-transfer traces:
 python3 scripts/check_16k_cycle_model.py
 ```
 
-This passes for the audited timing-only 4x4/2-H0/16-core configuration and
-compares phase timing, all NoC stall totals, and every accepted transfer. This
-timing coverage is separate from end-to-end arithmetic-payload verification.
+This compares phase timing, all NoC stall totals, and every accepted transfer.
+Coverage is specific to the dataset, engine counts, memory configuration, and
+source revision in the passing report; geometry alone is not a certificate.
+Timing coverage is separate from end-to-end arithmetic-payload verification.
+
+The full mesh testbench releases reset after the final reset falling edge.
+Accelerator cycle zero therefore precedes the first active DRAM falling edge:
+cycle one has elapsed 40 DRAM ticks in the default configuration. Both the
+cycle-stepped model and CIR exact-event idle prefix follow this edge contract.
+An extra initial tick shifts refresh timing even when early transfers match.
+`+MEM_TRACE_CLOCK` exposes this phase in VCS; `+MEM_TRACE_PREFIX=<path>` emits
+separate per-memory-system request/response and command traces.
+
+For a fresh VCS run, `scripts/check_cir_exact_vcs_trace.py` compares an exact-event
+replay against its log, accepted-transfer CSV, and NoC counter CSV. It fails on
+any phase, transfer-cycle, or stall-total difference and saves scoped evidence;
+it does not issue a general simulator or arithmetic-validation certificate.
 
 Run the arithmetic-enabled three-way 16K state audit with:
 
@@ -116,6 +130,48 @@ PYTHONPATH=model python3 -m azilla_cycle_model.cli simulate-events \
 
 ## CIR and cores-only execution modes
 
+### Current snapshot and validation boundary
+
+The September 7 snapshot includes the shared-fetch, two-slot endpoint model,
+its historical regression oracles, and opt-in timing acceleration. The complete
+Python suite currently passes 99 tests. This is not a universal RTL timing
+certificate. A separate 65,536-spin, one-H1 toroidal timing differential matches
+67,587 initialization, 16,849 iteration and 84,436 total cycles, including
+recorded core/memory/state/router events. It is timing-only and does not certify
+arithmetic at that size or arbitrary multi-H1 graphs.
+
+Run the portable Python checks with:
+
+```bash
+PYTHONPATH=model python3 -m unittest discover -s model/tests -v
+PYTHONPATH=model python3 -m azilla_cycle_model.shared_fetch_double_cli --help
+```
+
+The detailed model additionally requires the project Ramulator bridge and a
+compatible Ramulator checkout. Locally modified third-party sources, compiled
+libraries, archived validation traces, and campaign outputs are not bundled
+with this simulator source snapshot. Regenerate validation evidence for a
+different memory build; do not infer identical timing from Python tests alone.
+Campaign launchers referring to ignored local inventories are researcher
+automation, not a self-contained public reproduction package.
+
+For the **primary CIR-matched comparison**, cores-only must use
+`python3 -m azilla_cycle_model.shared_fetch_double_cli simulate-exact-events
+--execution-mode cores-only ...` (or `simulate-mapped-exact-events`). Require
+the exported fetch policy `single_fetch_two_slot_cir_routes_v3`. This provides
+single canonical fetch, two downstream forwarding slots and CIR-matched
+destination routing; see [the baseline contract](../docs/shared_fetch_baseline.md).
+The plain `cli`/`fast_cli` cores-only and `shared_fetch_cli` paths described in
+older examples remain historical variants and differential oracles. They must
+not populate primary comparison figures. The fast-model equivalence gate for
+the historical model does not authorize using `fast_cli` for the new baseline.
+
+`scripts/run_cir_matched_campaign.py` prepares and executes the version-checked
+replacement queue. It preserves old outputs, validates each new engine/memory
+configuration on a small VCS fixture, and records large runs as projections.
+Validation/arithmetic regression tests for historical variants remain useful
+but are not primary performance results.
+
 The event-compressed commands accept `--execution-mode cir`,
 `--execution-mode cores-only`, or `--execution-mode hybrid`. The default is
 `cir`.
@@ -124,14 +180,25 @@ The event-compressed commands accept `--execution-mode cir`,
   native H0, H1-local, or cross-H1 symmetric MVM. One job produces partials
   for both endpoint blocks.
 - `cores-only` assigns the two directions of every interaction to the two
-  destination spin cores. It performs two directed jobs and does not return
-  partial packets from the hierarchy.
+  destination spin cores. Weight placement does not change: H0-local,
+  H1-local, and cross-H1 blocks are read through the same canonical memory
+  interfaces used by CIR. The complete 1-KiB block is transported to each
+  destination core (32 256-bit flits per cross-H1 copy), rather than computing
+  beside the owner memory and returning compact partials. It performs two
+  directed jobs and does not return partial packets from the hierarchy.
 - `hybrid` constructs a static, exclusive partition: some interactions run at
   their destination cores and the remainder use their native CIR pool.
 
-For a controlled comparison, keep the dataset, geometry, engine counts,
-interconnect parameters, and iteration count identical and change only the
-execution mode:
+For a controlled comparison, keep the dataset, geometry, hierarchy provisioning
+parameters, canonical owners, memory configuration, interconnect parameters,
+and iteration count identical and change only the execution mode. CIR fetches
+each off-diagonal block once for symmetric computation; the implemented
+cores-only baseline fetches it twice for two directed jobs. Active compute
+counts and operand-cache capacities also differ. This compares combined
+placement/fetch mechanisms, not placement alone or equal-area designs. See the
+[comparison contract](../docs/comparison_contract.md) for controls and claim limits.
+
+Example paired invocation:
 
 ```bash
 for mode in cir cores-only; do
@@ -175,6 +242,41 @@ checks, and capacity elaboration through 256K. It is a representative,
 compositional validation envelope rather than a direct large-geometry RTL
 differential. Preserve the CLI accuracy label and the validation-manifest
 limitations in reported results.
+
+The exact-event cores-only path uses canonical H0/H1/cross Ramulator ownership.
+Memory, transport, and core retirement now advance concurrently. Each source
+has two 1-KiB reassembly buffers per configured hierarchy streamer lane and at
+most 64 outstanding requests; a buffer is released only after its last row is
+accepted by local delivery or the bounded cross-H1 router input. Each core has
+one active job and one receiving weight SRAM. Local sources share a 256-bit
+delivery lane per destination H0. Cross-H1
+ejection has priority, then local sources arbitrate by ascending system ID.
+The summary exports this provisional contract and occupancy counters under
+`cores_only_ablation.pipeline_contract`.
+
+The production path now shares `CoreMemoryPipeline` with the small integrated
+VCS differential below. That coverage is not a full-iteration or arbitrary
+multi-engine certificate. The earlier compositional envelope did not validate
+memory/transport feedback or local arbitration. Older outputs used either
+destination-H0 replication or separate DRAM/network/core replay phases;
+neither may be mixed into current comparisons.
+The contract retains two reads per unordered block pending a separate decision
+on read-once distribution. Own-block SRAM computation and frozen-state access
+timing require explicit integrated coverage before performance certification.
+
+`USE_MESH=1 bash scripts/run_core_memory_integration_vcs.sh` exercises three canonical
+Ramulator frontends, a shared local delivery arbiter, and eight directed core
+engines under VCS. `check_core_memory_integration.py` compares every accepted
+schedule, command, weight, and retirement event with the Python streamer and
+core FSM, including forced result backpressure and every offered weight/ejection
+stall. With `USE_MESH=1`, cross-source weight traffic traverses real FlooNoC
+routers and physical-link acceptance/stalls are also compared. These checks use
+the same kernel as the production exact-event path. `ENGINES` and
+`JOBS_PER_SOURCE` control source lanes and repeated directed work; tested lane
+counts include 1, 2, 4, and 16 with forced result stalls. The final stress checks
+also compare every accepted memory request/response tag and cycle. Repeated
+blocks stress queues rather than represent a solution-quality workload. Full
+iteration control, frozen-state timing, and diagonal work require further coverage.
 
 The event model removes spin/MVM arithmetic and schedules endpoint completion
 events. Empty NoC intervals are jumped over but remain in the reported cycle
@@ -238,6 +340,37 @@ the result object; these options only control file output.
 `scripts/check_exact_event_model.py` verifies both the 256-spin and 16K cases
 against stored RTL traces. It compares phase timing, all NoC stall totals, and
 every accepted injection, hop, and ejection by cycle and packet metadata.
+
+### Opt-in optimized exact execution
+
+For timing-only exact commands, the alternative entry point is
+`python -m azilla_cycle_model.fast_cli`, with the same arguments as `.cli`.
+It supports `simulate-exact-events` and `simulate-mapped-exact-events` in
+both `cir` (CIR-only) and `cores-only` modes. The original entry point remains the
+unchanged reference implementation.
+
+The optimized implementation caches combinational outputs between state
+changes, skips identity updates in idle streamers and empty networks, avoids
+repeated empty DRAM response polls, and replaces timing-only endpoint MVM
+row operations with an equivalent counter. It does **not** replace Ramulator
+with fixed memory latency or bypass active NoC arbitration, backpressure,
+state-bank conflicts, or pipeline completion delays.
+
+Validate a frozen candidate against a separately frozen reference with
+`scripts/check_fast_exact_model.py` (complete runs, byte-identical exported
+metrics and ordered transfers) and `scripts/check_fast_exact_windows.py`
+(large-geometry active windows, internal events and final state). Component
+tests are in `model/tests/test_fast_*.py`. Large-geometry windows establish
+sampled optimization equivalence, not full-run or additional RTL verification.
+The gated continuation tools refuse to launch outside the recorded validated
+configuration envelope and preserve existing in-flight runs and artifacts.
+
+Equivalent results retain the original fidelity labels and RTL coverage;
+optimization equivalence does not certify the underlying model against RTL.
+Existing performance/traffic data need not be regenerated solely for this
+optimization. Simulator wall-time measurements must still identify which
+implementation produced them, and arithmetic/solution-quality experiments
+continue to use their separate functional reference.
 
 ### Parameterized inter-H1 physical links
 
@@ -417,3 +550,22 @@ bijection and occupied block coordinates. A scheduling experiment can replace
 `owner_assigner`; the adapter then enforces 32-spin blocks, immutable H0/H1
 local placement, complete cross-H1 ownership, and artifact consistency before
 the performance model runs.
+
+## Cores-only full-controller validation
+
+`simulate-exact-events --execution-mode cores-only` now uses the full
+single-MVM core controller, canonical hierarchy-owned weight interfaces,
+banked operand-state SRAM, and one persistent mesh across iteration phases.
+The calibrated model is not a substitute for this validation path.
+
+Representative VCS coverage is currently 256 spins, two iterations, including
+4/2/4 hierarchy engines and injected memory/consumer backpressure. Arithmetic
+and timing-only executions are checked separately. Larger runs retain
+`cycle-structured-unverified`; representative coverage does not certify every
+geometry. Request-free initialization is bulk advanced and nonzero package-local
+link latency is currently rejected by this path pending integrated coverage.
+
+`scripts/run_core_full_readiness.sh` reruns the representative differential
+before executing separately labeled 16K scaling smokes. Set `OUTPUT_ROOT` to
+a new ignored results directory. It stops on failures or source changes;
+successful scale smokes are not large-geometry RTL certificates.

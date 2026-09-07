@@ -88,9 +88,10 @@ scripts/run_core_only_rtl_scale_check.sh
 scripts/run_cores_only_representative_vcs.sh
 ```
 
-It combines directed-core arithmetic/accounting, a two-endpoint real-FlooNoC
-exchange across three seeds and three backpressure levels, deterministic live
-Ramulator endpoint replay, and VCS capacity elaboration through 256K spins.
+It combines directed-core arithmetic/accounting, canonical-owner 1-KiB weight
+delivery to two endpoints through the real FlooNoC across three seeds and
+three backpressure levels, deterministic live Ramulator endpoint replay, and
+VCS capacity elaboration through 256K spins.
 The generated manifest records that the router/core and Ramulator endpoint are
 compositional subchecks; larger exact-event results remain projections from
 this representative validation envelope. Set `VCS_HOME` if `vcs` is not on

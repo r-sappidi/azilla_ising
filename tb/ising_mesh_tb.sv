@@ -471,9 +471,17 @@ module ising_mesh_tb #(
     always #(CLK_PERIOD_NS/2) clk = ~clk;
 
     // Advance modeled DRAM time by exactly one accelerator clock period.
-    always @(negedge clk)
-        if (USE_RAMULATOR && !rst)
+    longint diagnostic_dram_ticks = 0;
+    always @(negedge clk) begin
+        if (USE_RAMULATOR && !rst) begin
             az_dram_tick(RAMULATOR_TICKS_PER_CYCLE);
+            diagnostic_dram_ticks += RAMULATOR_TICKS_PER_CYCLE;
+            if ($test$plusargs("MEM_TRACE_CLOCK") &&
+                (cycle_count < 3 || (cycle_count >= 17289 && cycle_count <= 17292)))
+                $display("MEM_CLOCK cycle=%0d ticks=%0d time=%0t",
+                    cycle_count, diagnostic_dram_ticks, $time);
+        end
+    end
 
     always_ff @(posedge clk) begin
         if (rst)
@@ -2423,7 +2431,11 @@ module ising_mesh_tb #(
         noise_decay_i = '{default: 17'(NOISE_DECAY_VALUE)};
 
         repeat (5) @(negedge clk);
-        rst = 1'b0;
+        // Release after this edge's active/inactive processes: neither the
+        // global DRAM tick nor its #0 bridge may observe a partial reset edge.
+        // The first nonreset rising edge is accelerator cycle 0, with zero
+        // elapsed DRAM ticks; the following falling edge advances cycle 1.
+        rst <= 1'b0;
         @(negedge clk);
         init_start_i = '1;
         @(negedge clk);

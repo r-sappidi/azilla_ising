@@ -43,6 +43,60 @@ module ramulator_node_frontend #(
     logic [MEM_LANES-1:0][TAG_W-1:0] mem_rsp_tag;
     logic [$clog2(2*MVM_COUNT*SPIN_COUNT+1)-1:0] outstanding;
 
+    // Optional passive pre-edge trace. Separate files avoid cross-instance
+    // output ordering ambiguity; no delay or assignment touches the datapath.
+    integer diagnostic_file = 0;
+    longint diagnostic_cycle = 0;
+    longint diagnostic_start = 0;
+    longint diagnostic_end = 64'h7fff_ffff_ffff_ffff;
+    initial begin : configure_memory_diagnostic
+        string prefix;
+        string filename;
+        void'($value$plusargs("MEM_TRACE_START=%d", diagnostic_start));
+        void'($value$plusargs("MEM_TRACE_END=%d", diagnostic_end));
+        if ($value$plusargs("MEM_TRACE_PREFIX=%s", prefix)) begin
+            filename = $sformatf("%s_system%0d.csv", prefix, SYSTEM_ID);
+            diagnostic_file = $fopen(filename, "w");
+            if (!diagnostic_file) $fatal(1, "cannot open %s", filename);
+            $fdisplay(diagnostic_file,
+                "cycle,event,lane,valid,ready,tag,address,block_a,block_b");
+        end
+    end
+    always @(posedge clk) begin
+        if (rst) diagnostic_cycle <= 0;
+        else begin
+            diagnostic_cycle <= diagnostic_cycle + 1;
+            if (diagnostic_file && diagnostic_cycle >= diagnostic_start &&
+                diagnostic_cycle <= diagnostic_end) begin
+                for (int lane = 0; lane < MEM_LANES; lane++) begin
+                    if (mem_req_valid[lane])
+                        $fdisplay(diagnostic_file, "%0d,request,%0d,1,%0d,%0d,%0d,0,0",
+                            diagnostic_cycle, lane, mem_req_ready[lane],
+                            mem_req_tag[lane], mem_req_addr[lane]);
+                    if (mem_rsp_valid[lane])
+                        $fdisplay(diagnostic_file, "%0d,response,%0d,1,%0d,%0d,0,0,0",
+                            diagnostic_cycle, lane, mem_rsp_ready[lane], mem_rsp_tag[lane]);
+                end
+                for (int lane = 0; lane < MVM_COUNT; lane++) begin
+                    if (sched_cmd_valid_i[lane])
+                        $fdisplay(diagnostic_file, "%0d,schedule,%0d,1,%0d,0,0,%0d,%0d",
+                            diagnostic_cycle, lane, sched_cmd_ready_o[lane],
+                            sched_block_a_id_i[lane], sched_block_b_id_i[lane]);
+                    if (node_cmd_valid_o[lane])
+                        $fdisplay(diagnostic_file, "%0d,command,%0d,1,%0d,0,0,%0d,%0d",
+                            diagnostic_cycle, lane, node_cmd_ready_i[lane],
+                            node_block_a_id_o[lane], node_block_b_id_o[lane]);
+                    if (node_weight_valid_o[lane])
+                        $fdisplay(diagnostic_file, "%0d,weight,%0d,1,%0d,0,0,0,0",
+                            diagnostic_cycle, lane, node_weight_ready_i[lane]);
+                end
+            end
+        end
+    end
+    final begin
+        if (diagnostic_file) $fclose(diagnostic_file);
+    end
+
     dram_weight_streamer #(
         .MVM_COUNT(MVM_COUNT), .STATE_INDEX_W(STATE_INDEX_W),
         .GLOBAL_BLOCK_ID_W(GLOBAL_BLOCK_ID_W),

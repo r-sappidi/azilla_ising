@@ -493,11 +493,6 @@ class DirectPerformanceModel:
             quiet = 0 if active else quiet + 1
 
         pending = set(range(self.geometry.node_count))
-        # Match the RTL testbench's publish_completion task: entering the task
-        # consumes one falling edge before done_publish_valid_i is asserted.
-        # This cycle is architecturally visible in the full-system trace even
-        # though no completion flit is offered during it.
-        self._tick(epochs=epochs)
         while pending:
             destinations = [None] * self.geometry.node_count
             accepted = []
@@ -596,6 +591,7 @@ class RamulatorPerformanceModel(DirectPerformanceModel):
                 self.config.cross_mvm_count,
             )
         self._scheduler_commands: dict[DispatchPort, Any] = {}
+        self._ramulator_clock_started = False
 
     def _new_frontend(self, system_id: int, engines: int) -> _RamulatorFrontend:
         return _RamulatorFrontend(
@@ -632,6 +628,7 @@ class RamulatorPerformanceModel(DirectPerformanceModel):
                          (cross_changes or [{} for _ in range(count)])]
 
         if rst:
+            self._ramulator_clock_started = False
             for frontend in self.frontends.values():
                 frontend.streamer.reset()
                 frontend.request_ready = [False] * self.mem_lanes
@@ -645,7 +642,12 @@ class RamulatorPerformanceModel(DirectPerformanceModel):
 
         # Falling-edge DRAM bridge: advance DRAM time, offer current requests,
         # and refill response lanes before the next accelerator rising edge.
-        self.backend.tick(self.ticks_per_cycle)
+        # Reset is released after the final reset falling edge. The first
+        # nonreset rising edge (accelerator cycle zero) consequently has no
+        # preceding active DRAM falling edge; subsequent cycles have one.
+        if self._ramulator_clock_started:
+            self.backend.tick(self.ticks_per_cycle)
+        self._ramulator_clock_started = True
         for frontend in self.frontends.values():
             stream = frontend.streamer.outputs()
             frontend.request_ready = [

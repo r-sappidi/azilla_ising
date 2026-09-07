@@ -296,6 +296,11 @@ class HierarchyNode:
             old_partial_beat = engine.partial_beat
             old_result_read_slot = engine.result_read_slot
             old_result_write_slot = engine.result_write_slot
+            # RTL nonblocking assignments select from pre-edge validity even
+            # when loading or computing completes on this same edge.
+            old_slot_valid = tuple(engine.slot_valid)
+            old_result_valid = tuple(engine.result_valid)
+            old_result_reserved = tuple(engine.result_reserved)
 
             command_accepted = commands[index] is not None and before.command_ready[index]
             weight_accepted = weight_valid[index] and before.weight_ready[index]
@@ -335,9 +340,9 @@ class HierarchyNode:
                     engine.weight_beat = old_weight_beat + 1
 
             if old_state == engine.IDLE and engine_next[index] == engine.FETCH:
-                selected_j = 0 if engine.slot_valid[0] else 1
+                selected_j = 0 if old_slot_valid[0] else 1
                 selected_result = int(
-                    engine.result_valid[0] or engine.result_reserved[0]
+                    old_result_valid[0] or old_result_reserved[0]
                 )
                 engine.active_slot = selected_j
                 engine.result_write_slot = selected_result
@@ -363,7 +368,7 @@ class HierarchyNode:
 
             if (old_output_state == engine.OUTPUT_IDLE and
                     output_next[index] == engine.SEND_A):
-                engine.result_read_slot = 0 if engine.result_valid[0] else 1
+                engine.result_read_slot = 0 if old_result_valid[0] else 1
 
             if old_output_state in (engine.SEND_A, engine.SEND_B):
                 if accepted[index]:

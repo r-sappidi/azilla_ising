@@ -7,7 +7,10 @@ import ising_pkg::*;
 // controller marks the iteration's partial traffic complete. state_current is
 // frozen for the entire iteration; commit is the only operation that replaces
 // it with state_next.
-module spin_core (
+module spin_core #(
+    parameter bit CORES_ONLY = 1'b0,
+    parameter int GLOBAL_BLOCK_ID_W = 16
+) (
     input  logic                         clk,
     input  logic                         rst,
 
@@ -43,6 +46,22 @@ module spin_core (
     input  logic                         ext_partial_valid,
     output logic                         ext_partial_ready,
     input  logic signed [DATA_W-1:0]     ext_partial_data,
+
+    // Optional destination-local interaction path. CORES_ONLY shares the
+    // resident MVM with diagonal work; no second MVM is instantiated.
+    input  logic                         core_job_valid,
+    output logic                         core_job_ready,
+    input  logic [GLOBAL_BLOCK_ID_W-1:0] core_job_source_block_id,
+    input  logic                         core_job_transpose,
+    output logic                         core_state_req_valid,
+    input  logic                         core_state_req_ready,
+    output logic [GLOBAL_BLOCK_ID_W-1:0] core_state_req_block_id,
+    input  logic                         core_state_rsp_valid,
+    input  logic [SPIN_COUNT-1:0]        core_state_rsp_data,
+    input  logic                         core_weight_valid,
+    output logic                         core_weight_ready,
+    input  logic [DATA_W-1:0]            core_weight_data,
+    output logic                         core_job_done,
 
     // Frozen state for the current iteration.
     output logic [SPIN_COUNT-1:0]        state_next,
@@ -94,11 +113,46 @@ module spin_core (
     logic                      local_compute_done;
     logic                      done_latched;
     logic                      feedback;
+    typedef enum logic [2:0] {
+        JOB_IDLE, JOB_STATE_REQ, JOB_STATE_WAIT, JOB_LOAD, JOB_RUN, JOB_RETIRE
+    } job_state_t;
+    job_state_t job_state;
+    logic [GLOBAL_BLOCK_ID_W-1:0] job_source;
+    logic [SPIN_COUNT-1:0] job_source_state;
+    logic job_transpose;
+    logic [WEIGHT_BEAT_W-1:0] job_weight_beat;
+    logic diagonal_done;
+    logic signed [ACC_W-1:0] diagonal_result [0:SPIN_COUNT-1];
+    logic signed [ACC_W-1:0] mvm_result [0:SPIN_COUNT-1];
+    logic mvm_done;
+    logic mvm_start;
+    logic mvm_offdiagonal;
+    logic [SPIN_COUNT-1:0] mvm_state;
+
+    assign core_job_ready = CORES_ONLY && (core_state == CORE_ACCUMULATE) &&
+                            diagonal_done && (job_state == JOB_IDLE) &&
+                            !partials_done_pending;
+    assign core_state_req_valid = CORES_ONLY && (job_state == JOB_STATE_REQ);
+    assign core_state_req_block_id = job_source;
+    assign core_weight_ready = CORES_ONLY && (job_state == JOB_LOAD);
+    assign core_job_done = CORES_ONLY && (job_state == JOB_RETIRE);
+    assign mvm_offdiagonal = CORES_ONLY &&
+                            ((job_state == JOB_LOAD) || (job_state == JOB_RUN) ||
+                             (job_state == JOB_RETIRE));
+    assign mvm_start = (iter_start && (core_state == CORE_IDLE)) ||
+                      (CORES_ONLY && core_weight_valid && core_weight_ready &&
+                       job_weight_beat == WEIGHT_BEAT_W'(WEIGHT_BEATS-1));
+    assign mvm_state = mvm_offdiagonal ? job_source_state : state_current;
+    assign local_compute_done = CORES_ONLY ? diagonal_done : mvm_done;
+    always_comb begin
+        for (int spin=0; spin<SPIN_COUNT; spin++)
+            accumulator_local[spin] = CORES_ONLY ? diagonal_result[spin] : mvm_result[spin];
+    end
 
     assign weight_init_ready = (core_state == CORE_INIT) &&
                                (weight_beat_count < WEIGHT_BEATS);
-    assign h0_partial_ready = (core_state == CORE_ACCUMULATE);
-    assign ext_partial_ready = (core_state == CORE_ACCUMULATE);
+    assign h0_partial_ready = !CORES_ONLY && (core_state == CORE_ACCUMULATE);
+    assign ext_partial_ready = !CORES_ONLY && (core_state == CORE_ACCUMULATE);
     assign iter_done = (core_state == CORE_WAIT_COMMIT);
     assign local_weight_write_enable = weight_init_valid && weight_init_ready;
 
@@ -120,26 +174,27 @@ module spin_core (
         .ROW_W(SPIN_COUNT*WEIGHT_W)
     ) local_weight_sram (
         .clk,
-        .write_enable_i(local_weight_write_enable),
-        .write_slot_i(1'b0),
-        .write_row_i(weight_beat_count[WEIGHT_BEAT_W-1:0]),
-        .write_data_i(weight_init_data),
-        .read_slot_i(1'b0),
+        .write_enable_i(local_weight_write_enable || (core_weight_valid && core_weight_ready)),
+        .write_slot_i(CORES_ONLY && core_weight_valid && core_weight_ready),
+        .write_row_i(core_weight_ready ? job_weight_beat : weight_beat_count[WEIGHT_BEAT_W-1:0]),
+        .write_data_i(core_weight_ready ? core_weight_data : weight_init_data),
+        .read_slot_i(mvm_offdiagonal),
         .read_row_i(local_weight_read_row),
         .read_data_o(local_weight_read_data)
     );
 
     // The local MVM starts with the iteration and runs independently of
     // incoming hierarchy partials.
-    mvm mvm_local (
+    mvm #(.SUPPORT_TRANSPOSE(CORES_ONLY)) mvm_local (
         .clk,
         .rst,
-        .start(iter_start && (core_state == CORE_IDLE)),
+        .start(mvm_start),
         .weight_row_o(local_weight_read_row),
         .weight_data_i(local_weight_read_data),
-        .result(accumulator_local),
-        .state(state_current),
-        .done(local_compute_done)
+        .result(mvm_result),
+        .state(mvm_state),
+        .transpose_i(mvm_offdiagonal && job_transpose),
+        .done(mvm_done)
     );
 
     // ------------------------------------------------------------------
@@ -161,6 +216,13 @@ module spin_core (
             accumulator_ext <= '{default: '0};
             done_latched    <= 1'b0;
             lfsr_state      <= '0;
+            job_state <= JOB_IDLE;
+            job_source <= '0;
+            job_source_state <= '0;
+            job_transpose <= 1'b0;
+            job_weight_beat <= '0;
+            diagonal_done <= 1'b0;
+            diagonal_result <= '{default:'0};
         end
         else begin
             done_latched <= done ? 1'b1 : done_latched;
@@ -205,6 +267,42 @@ module spin_core (
                 h0_partial_beat_count <= '0;
                 ext_partial_beat_count <= '0;
                 partials_done_pending <= 1'b0;
+                diagonal_done <= 1'b0;
+                job_state <= JOB_IDLE;
+            end
+
+            if (CORES_ONLY && core_state == CORE_ACCUMULATE) begin
+                if (!diagonal_done && mvm_done) begin
+                    diagonal_result <= mvm_result;
+                    diagonal_done <= 1'b1;
+                end
+                unique case (job_state)
+                    JOB_IDLE: if (core_job_valid && core_job_ready) begin
+                        job_source <= core_job_source_block_id;
+                        job_transpose <= core_job_transpose;
+                        job_state <= JOB_STATE_REQ;
+                    end
+                    JOB_STATE_REQ: if (core_state_req_valid && core_state_req_ready)
+                        job_state <= JOB_STATE_WAIT;
+                    JOB_STATE_WAIT: if (core_state_rsp_valid) begin
+                        job_source_state <= core_state_rsp_data;
+                        job_weight_beat <= '0;
+                        job_state <= JOB_LOAD;
+                    end
+                    JOB_LOAD: if (core_weight_valid && core_weight_ready) begin
+                        if (job_weight_beat == WEIGHT_BEAT_W'(WEIGHT_BEATS-1)) begin
+                            job_weight_beat <= '0;
+                            job_state <= JOB_RUN;
+                        end else job_weight_beat <= job_weight_beat + 1'b1;
+                    end
+                    JOB_RUN: if (mvm_done) job_state <= JOB_RETIRE;
+                    JOB_RETIRE: begin
+                        for (int spin=0;spin<SPIN_COUNT;spin++)
+                            accumulator_h0[spin] <= accumulator_h0[spin] + mvm_result[spin];
+                        job_state <= JOB_IDLE;
+                    end
+                    default: job_state <= JOB_IDLE;
+                endcase
             end
 
             // Each accepted flit contributes PARTIAL_LANES accumulator words.
@@ -285,6 +383,7 @@ module spin_core (
                     core_state_n = CORE_ACCUMULATE;
             CORE_ACCUMULATE:
                 if (local_compute_done && partials_done_pending &&
+                    (!CORES_ONLY || (job_state == JOB_IDLE && !core_job_valid)) &&
                     (h0_partial_beat_count == '0) &&
                     (ext_partial_beat_count == '0))
                     core_state_n = CORE_FINALIZE;

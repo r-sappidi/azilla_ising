@@ -4,6 +4,11 @@ This repository contains the Azilla RTL, FlooNoC integration, Ramulator-backed
 memory timing, cycle-stepped Python model, accelerated exact-event timing
 model, and sparse graph-mapping interface.
 
+Primary cores-only comparisons now use the versioned CIR-matched single-fetch
+baseline, not the historical plain-CLI cores-only implementation. See
+[execution-mode instructions](model/README.md#cir-and-cores-only-execution-modes)
+and [the baseline contract](docs/shared_fetch_baseline.md) before starting sweeps.
+
 The commands below assume a Linux machine and are run from the repository
 root. The current reference environment uses Ubuntu 24.04, Python 3.13,
 Verilator 5.020, CMake 3.28, and a C++20 compiler. Python 3.10 or newer and

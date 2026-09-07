@@ -32,20 +32,34 @@ module symmetric_mvm (
     // The SRAM response arrives one cycle after this address is presented.
     assign weight_row_o = request_row;
 
-    // Complete the normal-direction dot product for the current row.
-    always_comb begin
-        row_dot_product = '0;
-`ifndef AZILLA_TIMING_ONLY
-        for (int column = 0; column < SPIN_COUNT; column++) begin
-            if (state_b[column])
-                row_dot_product = row_dot_product +
-                    ACC_W'($signed(weight_data_i[column*WEIGHT_W +: WEIGHT_W]));
-            else
-                row_dot_product = row_dot_product -
-                    ACC_W'($signed(weight_data_i[column*WEIGHT_W +: WEIGHT_W]));
+    // Balanced reduction: signed int8 times +/-1 needs 9 bits (including +128).
+    // 32 such terms fit exactly in 14 signed bits. No register/latency changes.
+    localparam int TREE_LEVELS = $clog2(SPIN_COUNT);
+    localparam int TREE_LEAVES = 1 << TREE_LEVELS;
+    localparam int SUM_W = WEIGHT_W + 1 + TREE_LEVELS;
+    wire signed [SUM_W-1:0] sum_tree [1:2*TREE_LEAVES-1];
+    generate
+        for (genvar leaf = 0; leaf < TREE_LEAVES; leaf++) begin : gen_terms
+            if (leaf < SPIN_COUNT) begin
+                wire signed [WEIGHT_W:0] extended_weight =
+                    {weight_data_i[leaf*WEIGHT_W+WEIGHT_W-1],
+                     weight_data_i[leaf*WEIGHT_W +: WEIGHT_W]};
+                wire signed [WEIGHT_W:0] signed_term =
+                    state_b[leaf] ? extended_weight : -extended_weight;
+                assign sum_tree[TREE_LEAVES+leaf] = signed_term;
+            end else begin
+                assign sum_tree[TREE_LEAVES+leaf] = '0;
+            end
         end
+        for (genvar branch = 1; branch < TREE_LEAVES; branch++) begin : gen_sums
+            assign sum_tree[branch] = sum_tree[2*branch] + sum_tree[2*branch+1];
+        end
+    endgenerate
+`ifdef AZILLA_TIMING_ONLY
+    assign row_dot_product = '0;
+`else
+    assign row_dot_product = ACC_W'($signed(sum_tree[1]));
 `endif
-    end
 
     always_ff @(posedge clk) begin
         if (rst) begin

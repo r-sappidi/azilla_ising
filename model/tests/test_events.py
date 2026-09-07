@@ -185,6 +185,17 @@ class EventCompressionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             model.run(hybrid_core_pairs=[(0, 1)])
 
+    def test_exact_event_explicit_hybrid_partition(self):
+        from azilla_cycle_model.exact_events import RamulatorEventPerformanceModel
+        # The exact path's explicit-partition API is exercised by its live
+        # Ramulator integration checks; keep the public signature guarded here.
+        self.assertIn(
+            "hybrid_core_pairs",
+            __import__("inspect").signature(
+                RamulatorEventPerformanceModel.run
+            ).parameters,
+        )
+
     def test_physical_link_parameters_are_labeled_as_projection(self):
         root = Path(__file__).resolve().parents[2]
         result = EventCompressedPerformanceModel(

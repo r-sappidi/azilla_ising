@@ -42,16 +42,22 @@ def main() -> None:
             int, match.groups()
         )
         delay = max(stall - 2, 0)
-        expected = (70 + delay, 2, 2, 2, 2 * delay, 3 + delay, 69 + delay)
+        # Two state flits plus two complete 32-flit weight streams leave the
+        # canonical cross-H1 owner. One state and one weight copy cross the
+        # physical link; the other copies eject locally at the owner node.
+        expected = (
+            104 + delay, 66, 66, 34, 2 * delay,
+            3 + delay, 103 + delay,
+        )
         observed = (cycles, injected, ejected, links, blocked, first, last)
         if observed != expected:
             raise AssertionError(
                 f"{path}: timing/traffic mismatch expected={expected} observed={observed}"
             )
-        # The exact-event model uses 67 cycles from buffered-block availability
-        # through retirement. RTL timestamps are inclusive, hence last-first+1.
-        if last - first + 1 != 67:
-            raise AssertionError(f"{path}: directed compute latency is not 67 cycles")
+        # This span includes the serialized canonical weight delivery to both
+        # endpoints followed by directed arithmetic.
+        if last - first + 1 != 101:
+            raise AssertionError(f"{path}: canonical delivery/compute span changed")
         if stall == 0 and first != replay.end_cycle:
             raise AssertionError(
                 f"{path}: RTL/model router completion mismatch "

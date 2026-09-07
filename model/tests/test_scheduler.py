@@ -3,7 +3,8 @@ import unittest
 from azilla_cycle_model.scheduler import (
     CROSS, H0, H1, ConcurrentDispatcher, DispatchPort, WorkTarget,
     allocate_h1_pairs, compile_cores_only_schedule,
-    compile_hybrid_schedule, compile_static_hybrid_schedule, compile_schedule,
+    compile_hybrid_schedule, compile_locality_hybrid_schedule,
+    compile_static_hybrid_schedule, compile_schedule,
 )
 from azilla_cycle_model.workload import Geometry, ScheduledBlock
 
@@ -77,6 +78,20 @@ class SchedulerTests(unittest.TestCase):
             compile_hybrid_schedule(
                 Geometry(1, 1, 1, 2), [(0, 1)], core_pairs=[(0, 2)],
             )
+
+    def test_locality_hybrid_keeps_only_same_h0_pairs_in_cir(self):
+        geometry = Geometry(2, 1, 2, 2)
+        pairs = [(0, 1), (0, 2), (0, 4), (4, 6)]
+        schedule = compile_locality_hybrid_schedule(geometry, pairs)
+        self.assertEqual(schedule.cir_pairs, ((0, 1),))
+        self.assertEqual(
+            schedule.core_pairs, ((0, 2), (0, 4), (4, 6)),
+        )
+        self.assertEqual(schedule.cir.counts, (1, 0, 0))
+        self.assertEqual(schedule.directed_core_jobs, 6)
+        self.assertEqual(
+            set(schedule.core_pairs) | set(schedule.cir_pairs), set(pairs)
+        )
 
     def test_concurrent_dispatch_holds_valid_and_refills(self):
         geometry = Geometry(1, 1, 1, 4)

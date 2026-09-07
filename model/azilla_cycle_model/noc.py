@@ -228,8 +228,10 @@ class FlooRouter:
     def _select_rr(requests: list[int], priority: int) -> int | None:
         if not requests:
             return None
-        above = [index for index in requests if index >= priority]
-        return min(above) if above else min(requests)
+        # cc_rr_arb_tree chooses each binary branch using the corresponding
+        # priority bit. With holes in the request vector this is XOR order,
+        # not a linear rotation (e.g. priority=1, requests={0,2} selects 0).
+        return min(requests, key=lambda index: index ^ priority)
 
     @staticmethod
     def _fair_next(requests: list[int], old_priority: int) -> int:
