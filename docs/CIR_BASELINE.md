@@ -1,5 +1,9 @@
 # CIR ablation contract
 
+**Historical directed-fetch contract.** This preserves the original baseline,
+not the current primary comparison. Use the [buffered v3 contract](shared_fetch_baseline.md)
+or separately labeled [streaming endpoint candidate](streaming_endpoints.md).
+
 This document fixes the baseline used to evaluate Azilla's compute-in-router
 (CIR) organization. It is an experimental contract, not a claim that the
 cores-only design is the preferred Azilla implementation.

@@ -43,6 +43,14 @@ sdist/
 .vscode/
 
 # HDL simulator and synthesis working state
+/csrc/
+/alib-*/
+/default.svf
+/vc_hdrs.h
+/ucli.key
+/tb/ucli.key
+/stack.info.*/
+/internal_stats.csv
 work/
 work_*/
 work-obj*.cf
@@ -94,6 +102,8 @@ core.*
 
 # Agent/model working notes and local assistant configuration.
 /AGENTS.md
+/agents.md
+/LOCAL_RESEARCH_STATUS.md
 **/AGENTS.md
 **/CLAUDE.md
 **/GEMINI.md
@@ -104,3 +114,19 @@ core.*
 .codex/
 .claude/
 .cursor/
+
+# Private resume/project brief.
+/project_work_and_results.docx
+/project_work_and_results.md
+/PAPER_DELIVERABLES.md
+/PAPER_OVERVIEW.md
+
+# MATLAB autosave files.
+*.asv
+
+# Unpublished manuscript sources and LaTeX build state (double-blind review).
+/paper/
+/acmart-primary/
+
+# Site-specific synthesis launcher with a hard-coded vendor library path.
+/scripts/start_support_synthesis.py

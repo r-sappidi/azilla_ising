@@ -15,6 +15,7 @@ module shared_fetch_single_h1_tb #(
   endfunction
   logic clk=0,rst=1;always #5 clk=~clk;
   integer cycle=0,completed=0,total_jobs=0,phase=0,offset=0,init_core=0,init_row=0,quiet=0,delay_count=0;
+  integer max_cycles=2000000;
   localparam int INITIAL=0,START_INIT=1,INIT_GAP=2,INIT_ROWS=3,INIT_NEXT=4,WAIT_INIT=5,
     GATHER=6,PUBLICATION=7,FILL=8,COMPUTE=9,COMPLETION=10,DONE=11,UPDATE=12,COMMIT_DELAY=13,FINISHED=14;
   typedef struct packed {logic [GW-1:0] a,b;} pair_t;
@@ -192,12 +193,15 @@ module shared_fetch_single_h1_tb #(
     endcase
     cycle<=cycle+1;
     if(cycle%10000==0) $display("PROGRESS cycle=%0d phase=%0d jobs=%0d/%0d",cycle,phase,completed,2*total_jobs);
-    if(cycle>2000000) $fatal(1,"timeout");
+    if(cycle>max_cycles) $fatal(1,"timeout max_cycles=%0d completed=%0d/%0d",max_cycles,completed,2*total_jobs);
   end
   initial begin
     integer f,n,cut,i,j,w,scan,a,b,s;
     bit pairs[longint unsigned];
     pair_t pair;
+    void'($value$plusargs("MAX_CYCLES=%d",max_cycles));
+    if(max_cycles<=0) $fatal(1,"MAX_CYCLES must be positive");
+    $display("TESTBENCH_MAX_CYCLES=%0d",max_cycles);
     for(int h=0;h<H0_COUNT;h++) begin external_lock[h]=-1;external_beat[h]=0;end
     for(int c=0;c<CORES;c++) begin active_source[c]=-1;active_engine[c]=-1;end
     for(int x=0;x<SOURCES;x++) issued[x]=0;

@@ -20,6 +20,6 @@ compiler=/home/rsappidi/miniforge3/envs/azilla/bin
   rtl/banked_state_sram.sv rtl/dram_weight_streamer.sv rtl/shared_fetch_replay.sv rtl/shared_fetch_replay_double.sv \
   rtl/azilla_floo_router.sv tb/ramulator_dpi_bridge.sv tb/ramulator_node_frontend.sv \
   tb/shared_fetch_single_h1_tb.sv tb/ramulator_dpi.cpp > "$output/build.log" 2>&1
-/usr/bin/time -v -o "$output/sim.time" "$build/simv" +DATASET="${DATASET:?DATASET required}" > "$output/rtl.log" 2>&1
+/usr/bin/time -v -o "$output/sim.time" "$build/simv" +DATASET="${DATASET:?DATASET required}" +MAX_CYCLES="${MAX_CYCLES:-2000000}" > "$output/rtl.log" 2>&1
 "$compiler/python3" scripts/check_shared_fetch_single_h1.py --dataset "$DATASET" --log "$output/rtl.log" \
   --output "$output/differential.json" --h0 "$h0" --cores "$cores" > "$output/differential.log" 2>&1

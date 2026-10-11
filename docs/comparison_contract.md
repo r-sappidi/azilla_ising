@@ -1,5 +1,10 @@
 # CIR versus cores-only comparison contract
 
+**Historical comparison details.** For current buffered v3 and streaming
+policies, use [shared-fetch](shared_fetch_baseline.md) and
+[streaming endpoints](streaming_endpoints.md). The directed-fetch accounting
+below must not be applied to those separately versioned designs.
+
 ## Question and scope
 
 The intended baseline now requires CIR-matched single fetch, downstream

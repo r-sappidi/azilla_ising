@@ -4,6 +4,22 @@ This repository contains the Azilla RTL, FlooNoC integration, Ramulator-backed
 memory timing, cycle-stepped Python model, accelerated exact-event timing
 model, and sparse graph-mapping interface.
 
+## Navigation and current evaluation
+
+- [Documentation index](docs/README.md) and [script index](scripts/README.md).
+- [Streaming endpoints](docs/streaming_endpoints.md): current opt-in RTL/model
+  candidate; buffered v3 remains a separately labeled comparison.
+- [C++ exact-event model](docs/cpp_exact_model.md): compiled port of the
+  exact-event timing model (CIR and streaming endpoints), byte-identical to
+  the Python model and checked against stored VCS traces.
+- [Repository maintenance](docs/repository_maintenance.md): layout, retention
+  rules and dry-run-first compiler-cache cleanup.
+
+Current local validation uses **VCS**. Verilator instructions below remain
+historical reproduction options, not the default for new campaigns. Calibrated
+event-model examples are likewise not the primary performance methodology;
+use validated exact-event paths and preserve configuration-specific coverage.
+
 Primary cores-only comparisons now use the versioned CIR-matched single-fetch
 baseline, not the historical plain-CLI cores-only implementation. See
 [execution-mode instructions](model/README.md#cir-and-cores-only-execution-modes)
@@ -134,6 +150,27 @@ directly RTL-differentially verified. See [tb/README.md](tb/README.md) and
 [model/README.md](model/README.md#cir-and-cores-only-execution-modes) for the
 coverage boundary and required result labels.
 
+## C++ exact-event model
+
+The Python exact-event model is the reference; `model/cpp_exact/` is a
+C++20 port of its timing-only paths that produces byte-identical metrics
+and transfer traces 2-46x faster, using the same Ramulator library.
+
+```bash
+cmake -S model/cpp_exact -B build/cpp_exact -DCMAKE_BUILD_TYPE=Release
+cmake --build build/cpp_exact --target azilla_exact -j4
+build/cpp_exact/azilla_exact simulate-exact-events --execution-mode cir \
+  --dataset tb/datasets/g256_smoke.txt --mesh-x 2 --mesh-y 1 \
+  --h0-per-h1 2 --cores-per-h0 2 --h0-mvms 1 --h1-mvms 1 --cross-mvms 1 \
+  --ramulator-library build/cycle_model_ramulator/libazilla_ramulator.so \
+  --ramulator-config tb/ramulator_128x32.yaml --metrics-prefix /tmp/smoke/metrics
+```
+
+`--execution-mode cores-only --endpoint-policy streaming` selects the
+streaming endpoint path. Equivalence checks and RTL comparisons are in
+`scripts/check_cpp_*.py`; see [the model document](docs/cpp_exact_model.md)
+for coverage, which is port equivalence and does not add RTL validation.
+
 ## Mapping experiments
 
 See [MAPPING_EXPERIMENTS.md](MAPPING_EXPERIMENTS.md) for the mapper artifact
@@ -158,15 +195,18 @@ tracked.
 
 ## CIR ablation
 
-See [docs/CIR_BASELINE.md](docs/CIR_BASELINE.md) for the frozen
-destination-stationary cores-only baseline, comparison controls, required
-metrics, and fidelity limits. The baseline is selected explicitly with
+See [docs/shared_fetch_baseline.md](docs/shared_fetch_baseline.md) for the
+buffered v3 comparison and [docs/streaming_endpoints.md](docs/streaming_endpoints.md)
+for the opt-in streaming architecture. The older directed-fetch contract in
+[docs/CIR_BASELINE.md](docs/CIR_BASELINE.md) is historical, not the primary
+baseline. The execution mode is selected explicitly with
 `--execution-mode cores-only`; CIR remains the default as
-`--execution-mode cir`. Both calibrated `simulate-events` and live-Ramulator
-`simulate-exact-events` accept the option, as do their mapped counterparts.
-See [model/README.md](model/README.md#cir-and-cores-only-execution-modes) for
-side-by-side commands and accuracy limitations. Cores-only exact-event and RTL
-results must not be inferred from the calibrated screening path.
+`--execution-mode cir`. Use live-Ramulator `simulate-exact-events` or its mapped
+counterpart through the appropriate versioned entry point. Older calibrated
+commands remain for historical reproduction, not primary evidence. See
+[model/README.md](model/README.md#cir-and-cores-only-execution-modes) for commands
+and coverage limits. Exact-event and RTL results cannot be inferred from a
+calibrated screening run.
 
 ## RTL workflows and generated files
 

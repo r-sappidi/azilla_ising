@@ -1,5 +1,11 @@
 # Azilla cycle model
 
+For current entry-point selection, see the [documentation index](../docs/README.md).
+Buffered v3 uses `shared_fetch_double_cli`; the separately labeled streaming
+candidate uses `streaming_cli`. Older directed-fetch and calibrated examples
+remain for historical reproduction, not primary performance evaluation.
+See [streaming endpoints](../docs/streaming_endpoints.md) for RTL coverage.
+
 For the end-to-end mapping experiment workflow, see
 [`MAPPING_EXPERIMENTS.md`](../MAPPING_EXPERIMENTS.md).
 
@@ -32,6 +38,20 @@ Current implemented and unit-tested primitives:
 A component or configuration is only described as RTL-differential when the
 corresponding trace comparison passes. Larger untested geometries retain the
 accuracy label emitted by the CLI.
+
+For dense shared-fetch v3 work/traffic equations, necessary latency bounds and
+the separately qualified CIR steady-state approximation, see
+[`docs/dense_analytical_model.md`](../docs/dense_analytical_model.md). This is
+not a replacement for exact-event/RTL latency validation at new mesh sizes.
+
+An isolated H0 routing optimization is available through
+`azilla_cycle_model.fast_adapter_cli`; see
+[`docs/fast_h0_adapter.md`](../docs/fast_h0_adapter.md) for equivalence checks
+and scope. It leaves the original adapter and existing fast-path gates intact.
+
+For an independent cores-only endpoint-bookkeeping optimization that preserves
+canonical shared-fetch v3, see
+[`docs/fast_shared_fetch.md`](../docs/fast_shared_fetch.md).
 
 Run the Python unit tests from the repository root:
 
@@ -569,3 +589,24 @@ link latency is currently rejected by this path pending integrated coverage.
 before executing separately labeled 16K scaling smokes. Set `OUTPUT_ROOT` to
 a new ignored results directory. It stops on failures or source changes;
 successful scale smokes are not large-geometry RTL certificates.
+
+## C++ port
+
+`model/cpp_exact/` reimplements the timing-only exact-event paths (`cir`,
+and `cores-only` with the streaming or buffered v3 endpoint policy) in C++20
+with one module per Python module and the same decision order. The Python
+model is the oracle; the port is verified byte-for-byte against it and
+against stored VCS traces. Build, run and coverage: `docs/cpp_exact_model.md`.
+
+## Opt-in streaming endpoints
+
+`python3 -m azilla_cycle_model.streaming_cli simulate-exact-events
+--execution-mode cores-only ...` selects the experimental accepted-row streaming
+endpoint. It retains canonical shared fetching and one physical MVM per core,
+but overlaps remote weight reception with arithmetic. Buffered v3 entry points
+and existing campaigns are unchanged. The new policy label ends in
+`_streaming_endpoint_v1`; do not combine it with buffered measurements.
+
+See [streaming endpoint implementation and validation](../docs/streaming_endpoints.md)
+for the RTL source selection, arithmetic/solution-equivalence gates, strict VCS
+differentials, and supported scope. This mode does not enable hybrid scheduling.

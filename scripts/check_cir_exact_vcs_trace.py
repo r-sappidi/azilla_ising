@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "model"))
 from azilla_cycle_model.exact_events import RamulatorEventPerformanceModel
 from azilla_cycle_model.performance import PerformanceConfig
-from azilla_cycle_model.workload import BlockOccupancyDataset, Geometry
+from azilla_cycle_model.workload import BlockOccupancyDataset, Geometry, load_schedule, validate_schedule
 from check_exact_event_model import rtl_transfers
 from check_16k_cycle_model import rtl_noc_totals
 
@@ -23,6 +23,7 @@ from check_16k_cycle_model import rtl_noc_totals
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, type=Path)
+    parser.add_argument("--schedule", type=Path)
     parser.add_argument("--rtl-log", required=True, type=Path)
     parser.add_argument("--rtl-events", required=True, type=Path)
     parser.add_argument("--rtl-noc", required=True, type=Path)
@@ -52,15 +53,19 @@ def main():
         parser.error("missing VCS phase timing in log")
     expected_timing = (int(init[1]), int(total[1]) - int(init[1]), int(total[1]))
     geometry = Geometry(args.mesh_x, args.mesh_y, args.h0_per_h1, args.cores_per_h0)
+    dataset = BlockOccupancyDataset.load(args.dataset)
+    schedule = load_schedule(args.schedule) if args.schedule else None
+    if schedule is not None:
+        validate_schedule(dataset, geometry, schedule)
     model = RamulatorEventPerformanceModel(
-        geometry, BlockOccupancyDataset.load(args.dataset),
+        geometry, dataset,
         dataset_path=str(args.dataset), ramulator_library=str(args.library),
         ramulator_config=str(args.config),
         config=PerformanceConfig(h0_mvm_count=args.h0_mvms,
                                  h1_mvm_count=args.h1_mvms,
                                  cross_mvm_count=args.cross_mvms, timing_only=True))
     try:
-        result = model.run()
+        result = model.run(schedule=schedule)
     finally:
         model.close()
     observed = sorted(model.transfers)
@@ -90,6 +95,8 @@ def main():
         i = next((i for i, (a, b) in enumerate(zip(expected, observed)) if a != b),
                  min(len(expected), len(observed)))
         evidence["first_difference"] = dict(index=i, rtl=expected[i:i+1], model=observed[i:i+1])
+    if args.schedule:
+        evidence['sha256'][str(args.schedule)] = hashlib.sha256(args.schedule.read_bytes()).hexdigest()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(evidence, indent=2) + "\n")
     print(json.dumps(evidence, indent=2), flush=True)
