@@ -49,7 +49,7 @@ FLOO_BUILD_DIR := ../build/ising_mesh_floo_$(FLOO_CONFIG)
 TIMING_ONLY_FLAG := $(if $(filter 1,$(TIMING_ONLY)),-DAZILLA_TIMING_ONLY,)
 VERILATOR_SPLIT_FLAGS := $(if $(filter-out 0,$(VERILATOR_OUTPUT_SPLIT)),--output-split $(VERILATOR_OUTPUT_SPLIT) --output-split-cfuncs $(VERILATOR_OUTPUT_SPLIT),)
 
-.PHONY: all run core-local-baseline-256-test core-local-baseline-256-vcs-test static-hybrid-256-test static-hybrid-256-vcs-test floo-router-test floo-mesh-build floo-mesh-test floo-mesh-dram-test ramulator-config dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
+.PHONY: all run core-local-baseline-256-test core-local-baseline-256-vcs-test static-hybrid-256-test static-hybrid-256-vcs-test floo-router-test floo-mesh-build floo-mesh-test floo-mesh-dram-test anchored-mesh-lint anchored-mesh-build anchored-mesh-test ramulator-config dram-streamer-test ramulator-node-perf-test hybrid-noc-build hybrid-noc-workload hybrid-noc-run hybrid-noc-test cycle-model-compute-trace-build cycle-model-spin-core-trace-build cycle-model-hierarchy-trace-build cycle-model-router-trace-build cycle-model-ramulator-library clean
 
 static-hybrid-256-test:
 	mkdir -p ../build/static_hybrid_256_tb
@@ -344,6 +344,78 @@ RAMULATOR_CONFIG_PREREQ := $(if $(filter 1,$(REGENERATE_RAMULATOR_CONFIG)),ramul
 # Full hierarchy with node-local Ramulator-backed projected GDDR interfaces.
 floo-mesh-dram-test: $(RAMULATOR_CONFIG_PREREQ)
 	$(MAKE) floo-mesh-test USE_RAMULATOR=1
+
+# CIR with H0-anchored symmetric ownership (rtl/experimental/anchored, see
+# docs/anchored_rtl.md).  The anchored files replace the base files of the
+# same module name; never compile both.  The VCS differential gate is
+# scripts/run_anchored_rtl_differentials.py; these targets give a Verilator
+# lint and an optional Verilator binary of the same file set.  Ramulator mode
+# is required and the schedule file comes from the C++ model
+# (+ANCHORED_SCHEDULE=PATH, written by --dump-anchored-schedule).
+ANCHORED_UPLINK_PACKETS ?= 4
+ANCHORED_ACCUMULATE ?= 1
+ANCHORED_SCHEDULE ?=
+ANCHORED_CONFIG := $(MESH_X_COUNT)x$(MESH_Y_COUNT)_h0$(H0_COUNT)_c$(CORES_PER_H0)_e$(H0_MVM_COUNT)-$(H1_MVM_COUNT)-$(CROSS_MVM_COUNT)_f$(FIFO_DEPTH)_i$(ITERATION_COUNT)_t$(TIMING_ONLY)_a$(ANCHORED_ACCUMULATE)_p$(ANCHORED_UPLINK_PACKETS)
+ANCHORED_BUILD_DIR := ../build/ising_mesh_anchored_$(ANCHORED_CONFIG)
+ANCHORED_RTL := rtl/ising_pkg.sv rtl/j_block_sram.sv rtl/banked_state_sram.sv \
+	rtl/mvm.sv rtl/symmetric_mvm.sv rtl/core.sv rtl/hierarchy_node.sv \
+	rtl/h0_adapter.sv \
+	rtl/experimental/anchored/h0_uplink.sv \
+	rtl/experimental/anchored/uplink_injection_arbiter.sv \
+	rtl/experimental/anchored/h0_tile.sv \
+	rtl/experimental/anchored/h1_child_adapter.sv \
+	rtl/experimental/anchored/h1_tile.sv \
+	rtl/h1_noc_adapter.sv rtl/cross_h1_node.sv rtl/azilla_floo_router.sv \
+	rtl/experimental/anchored/top_node.sv \
+	rtl/experimental/anchored/mesh_h1_tile.sv \
+	rtl/experimental/anchored/ising_mesh.sv \
+	rtl/dram_weight_streamer.sv tb/ramulator_dpi_bridge.sv \
+	tb/ramulator_node_frontend.sv tb/ising_mesh_anchored_tb.sv
+
+anchored-mesh-lint:
+	cd .. && $(VERILATOR) --lint-only --timing -Wno-fatal \
+		-Wno-WIDTH -Wno-UNUSED -Wno-DECLFILENAME -Wno-UNOPTFLAT -Wno-PINMISSING \
+		-Wno-TIMESCALEMOD -Wno-PINCONNECTEMPTY -Wno-CASEINCOMPLETE -Wno-ASCRANGE \
+		-Wno-MULTIDRIVEN -Wno-BLKSEQ -Wno-SYNCASYNCNET -Wno-IMPORTSTAR -Wno-LATCH \
+		-Wno-MODDUP -Wno-UNSIGNED \
+		--top-module ising_mesh_anchored_tb -GUSE_RAMULATOR=1 \
+		-f rtl/floo_router_files.f $(ANCHORED_RTL)
+
+anchored-mesh-build:
+	mkdir -p $(ANCHORED_BUILD_DIR)
+	cd .. && $(VERILATOR) --binary --timing --assert -Wno-fatal \
+		-j $(VERILATOR_JOBS) $(VERILATOR_SPLIT_FLAGS) \
+		$(TIMING_ONLY_FLAG) \
+		--top-module ising_mesh_anchored_tb \
+		--Mdir build/$(notdir $(ANCHORED_BUILD_DIR)) \
+		-GMESH_X_COUNT=$(MESH_X_COUNT) \
+		-GMESH_Y_COUNT=$(MESH_Y_COUNT) \
+		-GH0_COUNT=$(H0_COUNT) \
+		-GCORES_PER_H0=$(CORES_PER_H0) \
+		-GH0_MVM_COUNT=$(H0_MVM_COUNT) \
+		-GH1_MVM_COUNT=$(H1_MVM_COUNT) \
+		-GCROSS_MVM_COUNT=$(CROSS_MVM_COUNT) \
+		-GFIFO_DEPTH=$(FIFO_DEPTH) \
+		-GSKIP_ZERO_BLOCKS=1 \
+		-GUSE_RAMULATOR=1 \
+		-GMEM_PIN_COUNT=$(MEM_PIN_COUNT) \
+		-GMEM_PIN_GBPS=$(MEM_PIN_GBPS) \
+		-GMEM_LANES=$(MEM_LANES) \
+		-GITERATION_COUNT=$(ITERATION_COUNT) \
+		-GCOEFF_A_VALUE=$(COEFF_A_VALUE) \
+		-GCOEFF_B_VALUE=$(COEFF_B_VALUE) \
+		-GNOISE_AMPLITUDE=$(NOISE_AMPLITUDE) \
+		-GUPLINK_PACKETS=$(ANCHORED_UPLINK_PACKETS) \
+		-GACCUMULATE=$(ANCHORED_ACCUMULATE) \
+		-CFLAGS "-std=c++20 -I$(abspath $(RAMULATOR_DIR))/src" \
+		-LDFLAGS "-L$(abspath $(RAMULATOR_DIR)) -lramulator -Wl,-rpath,$(abspath $(RAMULATOR_DIR))" \
+		-f rtl/floo_router_files.f $(ANCHORED_RTL) $(abspath ramulator_dpi.cpp)
+	@echo "built ../build/$(notdir $(ANCHORED_BUILD_DIR))/Vising_mesh_anchored_tb"
+
+anchored-mesh-test: anchored-mesh-build
+	cd .. && build/$(notdir $(ANCHORED_BUILD_DIR))/Vising_mesh_anchored_tb \
+		+DATASET=$(DATASET) +ANCHORED_SCHEDULE=$(ANCHORED_SCHEDULE) \
+		+NOC_STATS_FILE=$(NOC_STATS_FILE) $(SIM_ARGS)
 
 clean:
 	rm -rf $(BUILD_DIR)

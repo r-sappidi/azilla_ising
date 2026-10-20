@@ -43,12 +43,13 @@ void usage() {
                  "usage: azilla_exact simulate-exact-events --dataset PATH --mesh-x N --mesh-y N\n"
                  "       --h0-per-h1 N --cores-per-h0 N --ramulator-library PATH --ramulator-config PATH\n"
                  "       [--schedule PATH] [--h0-mvms N] [--h1-mvms N] [--cross-mvms N] [--fifo-depth N]\n"
-                 "       [--mem-lanes N] [--ticks-per-cycle N] [--idle-refresh-period-ticks N] [--max-cycles N]\n"
-                 "       [--metrics-prefix PREFIX] [--transfer-trace PATH] [--execution-mode cir|cores-only]\n"
+                 "       [--mem-lanes N] [--max-outstanding N] [--ticks-per-cycle N] [--idle-refresh-period-ticks N] [--max-cycles N]\n"
+                 "       [--metrics-prefix PREFIX] [--transfer-trace PATH] [--execution-mode cir|cores-only|flat-stationary|cir-h0-anchored]\n"
                  "       [--link-latency-cycles N] [--link-flit-interval-cycles N] [--link-max-inflight-flits N]\n"
                  "       [--link-credit-return-cycles N] [--chiplet-link-latency-cycles N]\n"
                  "       [--dense-all-blocks 1] [--transfer-trace-stream PATH]\n"
                  "       [--endpoint-policy streaming|buffered-v3] [--stall-period N] [--core-events PATH]\n"
+                 "       [--dram-threads N]\n"
                  "   or: azilla_exact simulate-mapped-exact-events --artifact DIR --dataset PATH ... (same options,\n"
                  "       geometry/schedule/occupancy from the mapping artifact)\n"
                  "  --dense-all-blocks 1     occupy every unordered off-diagonal block pair (header-only dataset),\n"
@@ -58,7 +59,15 @@ void usage() {
                  "  --endpoint-policy        cores-only only: streaming (azilla_cycle_model.streaming_cli, default)\n"
                  "                           or buffered-v3 (azilla_cycle_model.shared_fetch_double_cli)\n"
                  "  --stall-period N         cores-only only: test-only weight stall period of the RTL checkers\n"
-                 "  --core-events PATH       cores-only only: dump the core/memory/state observer streams as CSV\n");
+                 "  --core-events PATH       cores-only only: dump the core/memory/state observer streams as CSV\n"
+                 "  --anchored-uplink-packets N  cir-h0-anchored only: partial packets buffered per H0 uplink (4)\n"
+                 "  --anchored-accumulate 1  cir-h0-anchored only: sum remote partials at the owner H0, flush once per core\n"
+                 "  --dump-anchored-schedule PATH  cir-h0-anchored only: write the compiled owner assignment (one\n"
+                 "                           'job owner_h0 block_a block_b' line per job in dispatch order) and the\n"
+                 "                           explicit publications ('pub block h1') for the RTL testbench\n"
+                 "  --dram-threads N         tick the independent Ramulator DRAM systems on N threads (default 1 =\n"
+                 "                           serial bridge call); N > 1 needs libazilla_ramulator_mt.so.  Results\n"
+                 "                           are bit-identical for every N; only wall time changes\n");
 }
 
 // Minimal reader for the fields of a mapping artifact manifest.json that
@@ -156,12 +165,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
         std::string execution_mode = args.str("execution-mode", "cir");
-        if (execution_mode != "cir" && execution_mode != "cores-only") {
-            std::fprintf(stderr, "the C++ port supports --execution-mode cir or cores-only\n");
+        if (execution_mode != "cir" && execution_mode != "cores-only" && execution_mode != "flat-stationary" &&
+            execution_mode != "cir-h0-anchored") {
+            std::fprintf(stderr, "the C++ port supports --execution-mode cir, cores-only, flat-stationary or cir-h0-anchored\n");
             return 2;
         }
         std::string endpoint_policy = args.str("endpoint-policy", "streaming");
-        if (execution_mode == "cir" && (args.has("endpoint-policy") || args.has("stall-period") || args.has("core-events"))) {
+        if (execution_mode != "cores-only" && (args.has("endpoint-policy") || args.has("stall-period") || args.has("core-events"))) {
             std::fprintf(stderr, "--endpoint-policy/--stall-period/--core-events apply to --execution-mode cores-only only\n");
             return 2;
         }
@@ -211,7 +221,47 @@ int main(int argc, char** argv) {
         config.execution_mode = execution_mode;
         config.endpoint_policy = endpoint_policy;
         config.stall_period = int(args.num("stall-period", 0));
+        config.dram_threads = int(args.num("dram-threads", 1));
+        config.anchored_uplink_packets = int(args.num("anchored-uplink-packets", 4));
+        config.anchored_accumulate = args.has("anchored-accumulate") && args.str("anchored-accumulate") != "0";
+        config.max_outstanding = int(args.num("max-outstanding", 64));
+        if (config.max_outstanding <= 0) throw std::runtime_error("--max-outstanding must be positive");
+        if (config.dram_threads < 1) {
+            std::fprintf(stderr, "--dram-threads must be at least 1\n");
+            return 2;
+        }
         long idle_refresh = args.num("idle-refresh-period-ticks", 0);
+
+        // Anchored RTL testbench input: the owner assignment is a software
+        // decision made here (compile_anchored_schedule); the testbench
+        // consumes it instead of recomputing it.  The same records the model
+        // run() compiles are compiled here, so the file is the model's
+        // schedule by construction.
+        if (args.has("dump-anchored-schedule")) {
+            if (execution_mode != "cir-h0-anchored") {
+                std::fprintf(stderr, "--dump-anchored-schedule applies to --execution-mode cir-h0-anchored only\n");
+                return 2;
+            }
+            std::vector<ScheduledBlock> records;
+            if (schedule) records = *schedule;
+            else for (const auto& [a, b] : dataset.active_pairs) records.push_back({a, b, -1});
+            CompiledSchedule compiled = compile_anchored_schedule(geometry, records, config.h0_mvm_count);
+            std::filesystem::path dump_path(args.str("dump-anchored-schedule"));
+            if (dump_path.has_parent_path()) std::filesystem::create_directories(dump_path.parent_path());
+            std::ofstream dump(dump_path);
+            if (!dump) throw std::runtime_error("cannot create " + dump_path.string());
+            dump << "geometry " << geometry.mesh_x << ' ' << geometry.mesh_y << ' ' << geometry.h0_per_h1 << ' '
+                 << geometry.cores_per_h0 << ' ' << config.h0_mvm_count << ' ' << int(config.anchored_accumulate)
+                 << ' ' << config.anchored_uplink_packets << '\n';
+            for (size_t owner = 0; owner < compiled.h0.size(); ++owner)
+                for (const auto& work : compiled.h0[owner])
+                    dump << "job " << owner << ' ' << work.block_a << ' ' << work.block_b << '\n';
+            for (const auto& [block, h1] : compiled.explicit_publications) dump << "pub " << block << ' ' << h1 << '\n';
+            dump << "end\n";
+            if (!dump) throw std::runtime_error("anchored schedule dump failed");
+            std::printf("anchored_schedule=%s jobs=%ld publications=%zu\n", dump_path.string().c_str(),
+                        compiled.count_h0(), compiled.explicit_publications.size());
+        }
 
         RamulatorEventPerformanceModel model(geometry, dataset, args.str("dataset"), args.str("ramulator-library"),
                                              args.str("ramulator-config"), int(args.num("mem-lanes", 16)),
@@ -273,6 +323,9 @@ int main(int argc, char** argv) {
         if (execution_mode == "cores-only")
             std::printf("cores_only directed_jobs=%ld endpoint_policy=%s stall_period=%d\n", result.directed_core_jobs,
                         endpoint_policy.c_str(), config.stall_period);
+        std::printf("dram_threads=%d parallel_dispatches=%llu dispatches_with_sleeping_worker=%llu\n",
+                    config.dram_threads, static_cast<unsigned long long>(model.backend().parallel_dispatches),
+                    static_cast<unsigned long long>(model.backend().parallel_dispatches_with_sleeper));
         std::printf("implementation=cpp_exact stage=3 execution_mode=%s\n", execution_mode.c_str());
         return 0;
     } catch (const std::exception& error) {

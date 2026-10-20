@@ -252,6 +252,16 @@ std::map<std::string, std::string> write_exact_event_metrics(const std::string& 
     if (result.execution_mode == "cores-only") {
         effective = {{"per_h0_destination_cores", geometry.cores_per_h0}, {"h1", 0}, {"cross", 0},
                      {"system_total", geometry.total_blocks()}};
+    } else if (result.execution_mode == "flat-stationary" || result.execution_mode == "cir-h0-anchored") {
+        // Only H0 engines and H0 DRAM systems do work; the H1/cross rows
+        // exist for schema compatibility and carry zero jobs.
+        int per_h0 = 0;
+        long total = 0, dram_systems = 0;
+        for (const auto& d : result.dram)
+            if (d.level == "h0") { per_h0 = d.engines; total += d.engines; ++dram_systems; }
+        effective = {{"per_h0", per_h0}, {"per_h1_local", 0}, {"per_h1_cross", 0}, {"system_total", total},
+                     {"active_dram_systems", dram_systems},
+                     {"h0_state_entries", geometry.total_blocks()}};
     } else {
         int per_h0 = 0, per_h1_local = 0, per_h1_cross = 0;
         bool have_h0 = false, have_h1 = false, have_cross = false;
@@ -308,6 +318,18 @@ std::map<std::string, std::string> write_exact_event_metrics(const std::string& 
                            {"epoch_done_flits", counters.type_flits[2]}, {"other_flits", counters.type_flits[3]},
                            {"average_hops", average_hops}, {"hop_histogram", hop_histogram}}},
     };
+    if (result.execution_mode == "cir-h0-anchored")
+        summary["anchored"] = JsonObject{{"uplink_sibling_beats", counters.uplink_sibling_beats},
+                                         {"uplink_sibling_stalls", counters.uplink_sibling_stalls},
+                                         {"uplink_mesh_beats", counters.uplink_mesh_beats},
+                                         {"uplink_mesh_stalls", counters.uplink_mesh_stalls},
+                                         {"engine_output_stalls", counters.engine_output_stalls},
+                                         {"engine_local_output_stalls", counters.engine_local_output_stalls},
+                                         {"engine_uplink_wait_stalls", counters.engine_uplink_wait_stalls},
+                                         {"engine_uplink_full_stalls", counters.engine_uplink_full_stalls},
+                                         {"engine_result_full_cycles", counters.engine_result_full_cycles},
+                                         {"flush_packets", counters.flush_packets},
+                                         {"flush_cycles_max", counters.flush_cycles_max}};
     JsonArray nodes_json, dram_json, noc_json;
     for (const auto& row : node_rows) nodes_json.emplace_back(object_from_row(row));
     for (const auto& row : dram_rows) dram_json.emplace_back(object_from_row(row));

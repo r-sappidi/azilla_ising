@@ -32,7 +32,16 @@ orphaned workers, source hashes, disk space and previous failure evidence.
   oracle and against stored CIR VCS traces, with the three-way statement.
 - `check_cpp_streaming_model.py`, `check_cpp_streaming_vcs_trace.py`,
   `run_streaming_oracle.py`, `run_streaming_rtl_all.py`: the same checks for
-  the C++ cores-only streaming/buffered endpoint path.
+  the C++ cores-only streaming/buffered endpoint path. Both model checkers
+  take `--cpp-library PATH` and repeatable `--cpp-arg` (C++ side only, e.g.
+  `--cpp-arg=--dram-threads --cpp-arg=8` with `libazilla_ramulator_mt.so`)
+  to compare threaded runs against the stored oracles with `--skip-python`.
+- `run_anchored_rtl_differentials.py`: VCS-vs-C++ gate for the anchored CIR
+  RTL (`rtl/experimental/anchored`, `docs/anchored_rtl.md`): builds and runs
+  `tb/ising_mesh_anchored_tb.sv` on small geometries against
+  `--execution-mode cir-h0-anchored` and compares timing, every NoC
+  transfer and NoC totals; the testbench consumes the model's
+  `--dump-anchored-schedule` file.
 - `audit_shared_fetch_v3.py`, `audit_validation_fairness.py`: baseline controls.
 - `check_16k_arithmetic.py`: independent arithmetic reference workflow.
 
@@ -75,6 +84,10 @@ noise schedules, update rule and iteration budgets with every quality result.
   `plot_rtl_internal_stats.py`: figures from scoped, labeled results.
 - `check_dense_analytical_model.py`, `verify_dense_analytical_v3.py`:
   analytical-model checks.
+- `gpu_dsb_step_benchmark.py`: PyTorch int8/fp16 GEMV + dSB step timing on a
+  CUDA GPU (ms per step, achieved weight-stream bandwidth) for a measured
+  single-GPU dense baseline; not run in this repository (no GPU), and the
+  GPU figures quoted in local notes are bandwidth arithmetic until it is.
 - `check_manuscript_draft.py`: manuscript checks.
 
 ## Maintenance and synthesis

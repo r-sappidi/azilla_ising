@@ -44,7 +44,9 @@ struct H1ChildOutputs {
 
 class H1ChildAdapter {
 public:
-    H1ChildAdapter(int child_count, int blocks_per_child, int mvm_count, int base_block_id);
+    // ``parent_first``: the mesh (parent) port wins over the local sources
+    // (cir-h0-anchored, so the mesh always drains); CIR keeps sources first.
+    H1ChildAdapter(int child_count, int blocks_per_child, int mvm_count, int base_block_id, bool parent_first = false);
     void reset();
     bool belongs(int child, int block) const;
     int select(int child, const std::vector<PartialOutput>& partials, const RoutedPartial& parent) const;
@@ -55,6 +57,7 @@ public:
     int blocks_per_child;
     int mvm_count;
     int base_block_id;
+    bool parent_first;
     std::vector<int> locked_source;  // -1 = None
     int parent_beat = 0;
 };

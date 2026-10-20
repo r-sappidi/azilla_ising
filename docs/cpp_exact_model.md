@@ -3,8 +3,11 @@
 `model/cpp_exact/` is a standalone C++20 reimplementation of the Python
 timing-only exact-event model
 (`azilla_cycle_model.exact_events.RamulatorEventPerformanceModel`). It covers
-execution mode `cir` (stage 1, below) and the cores-only shared-fetch v3
-endpoint policies, streaming and buffered (stage 3, later in this document).
+execution mode `cir` (stage 1, below), the cores-only shared-fetch v3
+endpoint policies, streaming and buffered (stage 3, later in this document),
+and two C++-only variants without Python or RTL counterparts: a flat
+weight-stationary state-exchange baseline and H0-anchored symmetric
+ownership (the two sections before the known gaps).
 It exists to run the same cycle-exact simulation much faster; the Python
 model remains the oracle and must not be changed to match the port.
 
@@ -230,6 +233,206 @@ the Python `core_event_observer` / `core_memory_observer` /
 Status and coverage: `results/cpp_exact_port_20261006/streaming/REPORT.md`
 (mirror: `/var/tmp/azilla_cpp_streaming_20261007/results/REPORT.md`).
 Port equivalence only; no new RTL coverage.
+
+## Threaded DRAM ticking (`--dram-threads N`, opt-in)
+
+85-100% of the C++ run time is spent inside the Ramulator bridge, ticking
+every independent DRAM system 40 times per accelerator cycle (20 systems at
+128K, 40 at 256K, 80 at 512K; ~0.43 us per system tick). `--dram-threads N`
+(default 1 = the historical serial `az_dram_tick` call) ticks the systems on
+N threads (N-1 persistent workers plus the calling thread). Only the tick
+phase is parallel: each system is claimed by one thread per dispatch and
+ticked 40 times; `send`, `pop`, statistics and all model logic stay on the
+calling thread in the original program order, so results are bit-identical
+by construction, not by tolerance. Verified in
+`results/cpp_exact_port_20261006/threaded/REPORT.md` (threads 1/2/4/8 against
+the stored serial outputs of the CIR, streaming and dense-128K/256K runs, and
+against stored VCS traces).
+
+N > 1 requires the multi-thread-capable bridge `libazilla_ramulator_mt.so`
+(`model/cpp_exact/ramulator_bridge_mt.cpp`, the same code as
+`tb/ramulator_dpi.cpp` plus per-system `az_dram_tick_system` and
+`az_dram_advance_clock`, linked against the unchanged
+`third_party/ramulator2/libramulator.so`). The RTL testbench and the Python
+model keep `build/cycle_model_ramulator/libazilla_ramulator.so`; the binary
+refuses N > 1 with a bridge that lacks the per-system entries.
+
+```bash
+cmake --build build/cpp_exact --target azilla_exact --target azilla_ramulator_mt -j4
+build/cpp_exact/azilla_exact simulate-exact-events ... \
+  --ramulator-library build/cpp_exact/libazilla_ramulator_mt.so --dram-threads 8
+```
+
+Thread-safety basis (details in the report): the bridge's only shared
+mutable state on the tick path is the global issue clock read by the
+completion callback for the latency statistic; the MT bridge keeps a
+per-system tick counter that observes the same values, and the caller
+advances the issue clock after all systems were ticked (asserted). Ramulator2
+holds only init-time static registries (factory, DRAM spec creators, logger
+names); `IMemorySystem::tick()` touches member state of one memory system.
+The submodule is not modified.
+
+Pool: workers spin (`AZILLA_DRAM_SPIN_US`, default 2000 us) before blocking
+on a condition variable; dispatch cost is ~1-5 us while spinning. The stdout
+line `dram_threads=N parallel_dispatches=... dispatches_with_sleeping_worker=...`
+reports how often a dispatch had to wake a sleeping worker. Speedup saturates
+on the serial model logic (Amdahl); see the report's performance table.
+Each thread adds no memory of note (RSS is unchanged within a few MB).
+
+`scripts/check_cpp_exact_model.py` and `scripts/check_cpp_streaming_model.py`
+accept `--cpp-library PATH` and repeatable `--cpp-arg` so the C++ side can be
+run with the MT bridge and `--dram-threads N` against the stored oracle
+directories (`--skip-python`).
+
+## Flat weight-stationary baseline (`--execution-mode flat-stationary`)
+
+A third execution mode, C++ only, implements the conventional Ising/SB
+accelerator organization as a comparison point for CIR: weights stay where
+the update happens and only spin states move.
+
+- Every occupied unordered block `(A, B)` is stored twice, as the row
+  representation at A's H0 and the transposed representation at B's H0, and
+  becomes two directed jobs on those H0s (`compile_flat_schedule`, the same
+  expansion as the cores-only schedule). H1-local and cross-H1 owners,
+  engines and DRAM systems do no work (their rows carry zero jobs).
+- Each H0 engine is the hierarchy engine in a directed configuration
+  (`Engine::directed`): it fetches one operand (the source block's 1-bit
+  states) from the H0 state table and returns one 128-byte partial to its
+  local core through the H0 adapter, on chip. The block pass still takes 32
+  row-serial cycles, so a directed engine produces one partial per 32 cycles
+  where the symmetric CIR engine produces two; at equal engine counts it has
+  half the multipliers and half the useful work per streamed weight byte.
+- The H0 state table is indexed by global block (`total_blocks` entries, 4
+  bytes each) and is filled with one write per distinct source block the
+  H0 consumes before its engines start (the H1-table fill rule of CIR).
+- State exchange between H1s uses the CIR publication mechanism unchanged:
+  one `NOC_STATE` flit per (source block, consuming H1) pair with differing
+  H1s, released at the CIR cadence before compute; no partial flits cross the
+  NoC. The epoch-done barrier is the same as CIR.
+- Everything else (DRAM addressing, streamer, lanes, Ramulator config, mesh,
+  arbitration, initialization cycles, metrics schema) is shared with `cir`.
+  `--h0-mvms` sets the directed engines per H0; `--h1-mvms`/`--cross-mvms`
+  are accepted for schema compatibility only.
+
+The summary reports `execution_mode = flat-stationary`,
+`effective_mvm_engines` with `active_dram_systems` (one per H0) and
+`h0_state_entries`, and the `cores_only_ablation` block with the directed job,
+read and stored-copy counts (two per unordered block) and the remote state
+packet count. No RTL implements this baseline; `accuracy` is always
+`cycle-structured-unverified`. The CIR and cores-only paths are unchanged
+(`Engine::directed` defaults to false and is never set outside this mode);
+the regression harnesses were re-run byte-identical after the change.
+Campaign: `results/flat_stationary_baseline_20261015/`.
+
+## H0-anchored symmetric ownership (`--execution-mode cir-h0-anchored`)
+
+A CIR variant, C++ only, that keeps the single symmetric fetch but removes
+the hierarchy owners: a block inside one H0 stays there; every other block is
+owned by one endpoint H0 and evaluated once by that H0's symmetric engines.
+The local partial reaches its core through the H0 adapter as in CIR; the
+remote partial leaves through one 256-bit uplink per H0 (`H0Uplink`,
+`model/cpp_exact/anchored.cpp`):
+
+- Input side: round-robin, packet-locking selection over the engines whose
+  current partial addresses another H0 (the cross-node rule), one beat per
+  cycle into two FIFOs of `--anchored-uplink-packets` (default 4) four-beat
+  partials, one for sibling H0s and one for other H1s.
+- Output side, one beat per cycle: a sibling partial is switched by the H1
+  child crossbar, which in this mode has `h1_mvms + h0_per_h1` sources and
+  gives the mesh (parent) port priority so the mesh always drains; a partial
+  for another H1 is arbitrated among the H1's uplinks
+  (`UplinkInjectionArbiter`), takes the cross node's slot in the local
+  injection arbiter and travels the mesh to the existing cross-partial
+  receive path. Between packets the uplink moves to the other queue when its
+  head is not accepted.
+- Owner choice (`compile_anchored_schedule`): forced within-H0 blocks are
+  counted first; the off-H0 blocks are grouped by H0 pair, split by a
+  sequential greedy on the cost max(engine load, owner H1 injection-port
+  load) with engine load 32/engines cycles per job and port load 4 beats x 3
+  per cross-H1 packet (the weight that balanced community 128K's two ports
+  under eight-way arbitration; `AZILLA_ANCHORED_PORT_WEIGHT` overrides it),
+  then refined by local search that moves batches of blocks off the heaviest
+  H0s (tried in descending load order) while the lexicographic objective
+  (max port load over H1s, H0 loads sorted descending) improves. The
+  sequential greedy alone leaves a load gradient in H0 order (dense 128K:
+  297K-753K jobs per H0), and a makespan-only objective stalls on tied
+  maxima; the sorted-vector form balanced dense 128K and community 128K
+  (47.9K-50.0K jobs). A scheduling heuristic, not a hardware parameter.
+- H0 state tables are global-indexed and filled like the flat baseline;
+  publications are the (endpoint block, owner H1) pairs whose H1s differ.
+  H1 and cross engines and DRAM systems carry no jobs. The quiet window
+  before the epoch-done barrier waits for every H0 node as well as the cross
+  nodes (H0s are the mesh sources here).
+
+Per unordered block: one read, one stored copy, at most four partial flits on
+the mesh (CIR: eight for cross-owned blocks). The summary carries an
+`anchored` block with uplink beat/stall and engine output-stall counters.
+`accuracy` is reported as `cycle-structured-unverified`.
+
+`--anchored-accumulate 1` (accumulate-at-owner): the uplink sums each remote
+partial beat into a per-remote-block accumulator at the owner H0 (one
+read-modify-write beat per cycle, never stalls the engine) and, once the H0
+node is done, flushes one four-beat packet per touched remote block in
+ascending block order through the same FIFOs; the quiet window also waits
+for every uplink to have flushed.
+
+October 15 model fix (anchored-guarded code only): the RUN -> quiet-window
+condition now requires every uplink to be *drained* (`H0Uplink::drained()`:
+`flushed()` in accumulate mode, both FIFOs empty in FIFO mode). Before, FIFO
+mode ignored the uplink FIFOs, so `EPOCH_DONE` could be injected while a
+sibling-bound packet was still queued at an uplink (not NoC activity), i.e.
+a partial delivered after completion; the RTL testbench waits for the drain
+and the VCS differential exposed the gap (dense 512-spin 2x1 FIFO case: RTL
+470 vs model 454 iteration cycles; the only differing transfers were the
+`EPOCH_DONE` flits). Effect of the fix on the 17 small smoke cases re-run in
+`cir-h0-anchored` (`results/anchored_rtl_20261015/model_fix/`): accumulate
+mode byte-identical in all 17; FIFO mode changed in 4 (iteration +4 to +16
+cycles), identical in 13. `cir` mode outputs are byte-identical to the stored
+October 6 cases (the change sits inside the `anchored` guard). The campaign
+`results/flat_stationary_baseline_20261015/` (anchored `anch4` points, FIFO
+mode) predates the fix; its iteration counts can be low by at most the tail
+drain of the last uplink, a few tens of cycles, not re-run.
+
+RTL: `rtl/experimental/anchored/` implements this mode (accumulate and FIFO
+uplinks) as a swap-in set with the testbench `tb/ising_mesh_anchored_tb.sv`;
+`--dump-anchored-schedule PATH` writes the compiled owner assignment and
+publications the testbench consumes. Small-geometry VCS/C++ differentials
+(timing, every NoC transfer, NoC totals, plus the testbench's functional
+next-state check): `scripts/run_anchored_rtl_differentials.py`,
+`results/anchored_rtl_20261015/REPORT.md`, `docs/anchored_rtl.md`. Those
+configurations are RTL-matched; everything else in this mode remains
+cycle-structured-unverified (the summary label is not changed).
+
+## Clock ratio, front end and memory technology (October 2026)
+
+Three options, all modes, defaults unchanged and byte-identical to the
+recorded evidence (`results/anchored_rtl_20261015/model_fix/default64.json`):
+
+- `--ticks-per-cycle N`: Ramulator ticks (250 ps) per accelerator cycle.
+  40 is the RTL-verified ratio (10 ns, 100 MHz, `docs/comparison_contract.md`);
+  4 models a 1 ns cycle against the same memory. Convert cycles to time with
+  the ratio actually used; the 1 GHz figures are a modeling assumption, not a
+  closed timing result.
+- `--max-outstanding N`: 32-byte requests in flight per H0 streamer
+  (`PerformanceConfig::max_outstanding`, RTL `dram_weight_streamer`
+  `MAX_OUTSTANDING`, default 64). At 4 ticks per cycle 64 x 32 B caps the
+  stream near 92 B per cycle per H0 at ~20 cycles of DRAM latency; the 1 GHz
+  campaigns use 256.
+- `--ramulator-config`: `tb/ramulator_hbm4_config.py` exports a co-packaged
+  HBM4 slice (Ramulator2 `HBM4`, `HBM4_32Gb_4Hi`, 8 Gb/s, 8 x 64-bit channels
+  per H0 = 512 GB/s, the same peak as the 128-pin GDDR6 projection; the tick
+  stays 250 ps). `AZILLA_ADDR_MAPPER=MOP4CLXOR` replaces the `RoBaRaCoCh`
+  map, under which a sequential 32-byte stream lands in one bank group and is
+  tCCD_L-bound at 4 ticks per cycle; with MOP4 the remaining plateau is the
+  activate rate (1 KB rows, 4 lines per activate, ~261 B per cycle per H0 at
+  the 512 B peak). The RTL testbench still hardcodes `tb/ramulator_128x32.yaml`.
+
+Campaigns: `results/clock_sensitivity_20261019` (calibration grid),
+`results/dense_1ghz_hbm4_20261019` and `results/sparse_1ghz_hbm4_20261020`
+(anchored+accumulate 16 engines/H0 vs flat 32 engines/H0 at 4 ticks, HBM4,
+MOP4, 256 outstanding). All are cycle-structured-unverified: no RTL
+differential exists at 4 ticks, 16/32 engines or 256 outstanding, and the
+testbench lacks parameters for the outstanding count and the yaml.
 
 ## Known gaps
 

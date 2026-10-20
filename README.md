@@ -7,6 +7,9 @@ model, and sparse graph-mapping interface.
 ## Navigation and current evaluation
 
 - [Documentation index](docs/README.md) and [script index](scripts/README.md).
+- [Current architecture](docs/current_architecture.md): H0-anchored CIR with
+  accumulate-at-owner uplinks (the design evaluated since October 2026), its
+  flat state-exchange baseline, and verification status.
 - [Streaming endpoints](docs/streaming_endpoints.md): current opt-in RTL/model
   candidate; buffered v3 remains a separately labeled comparison.
 - [C++ exact-event model](docs/cpp_exact_model.md): compiled port of the

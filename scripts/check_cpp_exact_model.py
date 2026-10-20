@@ -263,10 +263,24 @@ def main():
                         help='rebuild comparison_report.json from cases/*/comparison.json without running')
     parser.add_argument('--binary', type=Path, default=None,
                         help='C++ binary to test instead of build/cpp_exact/azilla_exact_cir (recorded in the report)')
+    parser.add_argument('--cpp-library', type=Path, default=None,
+                        help='Ramulator bridge library for the C++ side only (e.g. libazilla_ramulator_mt.so); '
+                             'the oracle keeps build/cycle_model_ramulator/libazilla_ramulator.so')
+    parser.add_argument('--cpp-arg', action='append', default=[],
+                        help='extra argument appended to the C++ command only (repeatable, e.g. '
+                             '--cpp-arg=--dram-threads --cpp-arg=4)')
     args = parser.parse_args()
     global CPP
     if args.binary is not None:
         CPP = args.binary.resolve()
+    cpp_library = args.cpp_library.resolve() if args.cpp_library is not None else None
+
+    def cpp_side_args(cargs):
+        out_args = list(cargs)
+        if cpp_library is not None:
+            out_args[out_args.index('--ramulator-library') + 1] = str(cpp_library)
+        return out_args + list(args.cpp_arg)
+
     selected = [c for c in cases() if (args.only is None or c['name'] in args.only) and args.filter in c['name']]
     if args.list:
         for c in selected:
@@ -285,6 +299,9 @@ def main():
         ramulator_library_sha256=sha256(LIBRARY),
         ramulator_config_sha256=sha256(YAML),
         cpp_binary_sha256=sha256(CPP) if CPP.exists() else None,
+        cpp_ramulator_library=str(cpp_library) if cpp_library is not None else str(LIBRARY),
+        cpp_ramulator_library_sha256=sha256(cpp_library) if cpp_library is not None else sha256(LIBRARY),
+        cpp_extra_args=list(args.cpp_arg),
     )
 
     def save():
@@ -328,6 +345,9 @@ def main():
         item = dict(case=case, dataset=str(dataset), dataset_sha256=sha256(dataset),
                     ramulator_config=str(yaml), ramulator_config_sha256=sha256(yaml),
                     cpp_binary_sha256=sha256(CPP) if CPP.exists() else None,
+                    cpp_ramulator_library=report['cpp_ramulator_library'],
+                    cpp_ramulator_library_sha256=report['cpp_ramulator_library_sha256'],
+                    cpp_extra_args=list(args.cpp_arg),
                     cpp_sources_sha256=report['cpp_sources_sha256'],
                     python_sources_sha256=report['python_sources_sha256'], execution=[])
         transfers = case.get('transfers', True)
@@ -346,7 +366,7 @@ def main():
                                               oracle_dir, transfers))
         cpp_dir = case_dir / 'cpp'
         if not args.skip_cpp:
-            item['execution'].append(run_side('cpp', [str(CPP)], cargs, cpp_dir, transfers))
+            item['execution'].append(run_side('cpp', [str(CPP)], cpp_side_args(cargs), cpp_dir, transfers))
         if any(r.get('returncode') for r in item['execution']):
             item['status'] = 'execution-failure'
             report['cases'][name] = item

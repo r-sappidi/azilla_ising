@@ -155,3 +155,54 @@ def dense_model(spins, mode="cir", geometry=None, engines=(4, 2, 4)):
                 iteration_lower_bound_cycles=max(bounds.values()), resource_bounds=bounds,
                 cir_steady_state_estimate_cycles=estimate,
                 timing_scope="analytical projection; lower bounds are not measured latency; CIR estimate omits startup, DRAM and contention penalties")
+
+
+def anchored_accumulate_model(spins, geometry=None, h0_engines=4):
+    """Dense iteration estimate for execution mode ``cir-h0-anchored`` with
+    ``--anchored-accumulate 1`` (C++ exact-event model, docs/cpp_exact_model.md).
+
+    The design has no per-block mesh traffic, so the iteration decomposes into
+    additive terms with no queueing coupling: the publication phase at the CIR
+    cadence, the H0 state-table fill, saturated symmetric-engine service on the
+    balanced per-H0 job count (38 cycles per job, +1 for same-bank operand
+    pairs, estimated as one job in eight for global block indices), the
+    accumulator flush (bounded by the busiest of the H0 uplink, the per-H1 mesh
+    injection port and a child crossbar port), and the completion barrier.
+
+    Validation against the C++ model (no fitted terms, flush at its bound):
+    64K 1x1 2,506,578 vs 2,526,591 observed (-0.79%); 128K 2x1 5,073,746 vs
+    5,103,624 (-0.59%); 256K 2x2 10,246,994 vs 10,374,012 (-1.22%).
+    The flush term is 1-3% of the iteration; its mesh part grows with the
+    mesh (observed/bound 1.4 at 2x2). Dense only; balanced ownership assumed.
+    """
+    if spins <= 0 or spins % 32:
+        raise ValueError("positive, block-aligned spin count required")
+    g = geometry or fixed_h1_geometry(spins)
+    b = spins // 32
+    if b != g.total_blocks:
+        raise ValueError("anchored estimate covers fully populated geometries only")
+    total_h0 = g.node_count * g.h0_per_h1
+    jobs = choose2(b)
+    jobs_per_h0 = ceil(jobs / total_h0)
+    same_bank = jobs_per_h0 // 8
+    engine_cycles = ceil((38 * jobs_per_h0 + same_bank) / h0_engines)
+    publications = b * (g.node_count - 1)      # every block to every other H1
+    compute_start = 2 * publications + 4
+    fill = b + 2                                # distinct sources per H0 (+2)
+    remote_cores = b - g.cores_per_h0
+    cross_cores = b - g.blocks_per_h1
+    flush_bound = max(4 * remote_cores,                          # one uplink, 4 beats per packet
+                      4 * g.h0_per_h1 * cross_cores,             # one mesh port per H1
+                      4 * (g.h0_per_h1 - 1) * g.cores_per_h0)    # one crossbar child port
+    barrier = 16
+    estimate = compute_start + max(fill, 0) + engine_cycles + flush_bound + barrier
+    return dict(schema="dense-anchored-accumulate-v1", spins=spins, geometry=asdict(g),
+                h0_engines=h0_engines, canonical_jobs=jobs, jobs_per_h0=jobs_per_h0,
+                terms=dict(compute_start=compute_start, fill=fill, engine=engine_cycles,
+                           flush_bound=flush_bound, barrier=barrier),
+                canonical_weight_bytes=1024 * jobs, dram_row_requests=32 * jobs,
+                flush_packets_per_h0=remote_cores, mesh_flush_flits_per_h1=4 * g.h0_per_h1 * cross_cores,
+                iteration_estimate_cycles=estimate,
+                timing_scope="analytical projection for cir-h0-anchored + accumulate; "
+                             "validated -0.8%/-0.6%/-1.2% at 64K/128K/256K against the C++ model; "
+                             "cycle-structured, no RTL at these sizes")

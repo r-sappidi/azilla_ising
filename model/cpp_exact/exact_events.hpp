@@ -11,6 +11,7 @@
 
 #include "adapters.hpp"
 #include "cross.hpp"
+#include "anchored.hpp"
 #include "events.hpp"
 #include "hierarchy.hpp"
 #include "json.hpp"
@@ -36,6 +37,17 @@ struct PerformanceConfig {
     // period (arithmetic_fixture['stall_period'] of the Python checkers).
     std::string endpoint_policy = "streaming";
     int stall_period = 0;
+    // Threads ticking the independent Ramulator systems (1 = serial bridge
+    // call, the historical behaviour).  Timing results do not depend on it.
+    int dram_threads = 1;
+    // cir-h0-anchored only: four-beat partial packets buffered at each H0 uplink.
+    int anchored_uplink_packets = 4;
+    // cir-h0-anchored only: accumulate remote partials at the owner H0 and
+    // flush one packet per touched remote core after its engines finish.
+    bool anchored_accumulate = false;
+    // Outstanding 32-byte weight requests per DRAM streamer (RTL
+    // dram_weight_streamer MAX_OUTSTANDING, default 64).
+    int max_outstanding = 64;
 };
 
 struct PerformanceCounters {
@@ -47,6 +59,16 @@ struct PerformanceCounters {
     long ejection_stalls = 0;
     long link_stalls = 0;
     long type_flits[4] = {0, 0, 0, 0};
+    // cir-h0-anchored only (cycle sums over all H0s / engines).
+    long uplink_sibling_beats = 0, uplink_sibling_stalls = 0;  // offered to the H1 crossbar
+    long uplink_mesh_beats = 0, uplink_mesh_stalls = 0;        // offered to the mesh injection
+    long engine_output_stalls = 0;       // engine partial valid, not accepted (local or uplink)
+    long engine_local_output_stalls = 0;   // ... of which the partial is for a local core
+    long engine_uplink_wait_stalls = 0;    // ... remote and not the uplink's selected engine
+    long engine_uplink_full_stalls = 0;    // ... remote, selected, FIFO full
+    long engine_result_full_cycles = 0;  // both result slots occupied (compute blocked on output)
+    long flush_packets = 0;              // accumulate: packets flushed (sum over H0s)
+    long flush_cycles_max = 0;           // accumulate: longest H0 flush (node DONE -> uplink drained)
 };
 
 struct NocResourceStats {
@@ -112,6 +134,7 @@ public:
                                    long idle_tick_modulus /* <=0: none */, const PerformanceConfig& config);
     ExactEventResult run(const std::vector<ScheduledBlock>* schedule);
     void close() { backend_->finalize(); }
+    const RamulatorBackend& backend() const { return *backend_; }
 
     // Opt-in streaming transfer trace: every accepted transfer is written to
     // ``path`` (RTL event schema, generation order, which is cycle
@@ -170,6 +193,9 @@ private:
     std::vector<std::unique_ptr<CrossH1Node>> cross_nodes_;    // by node
     std::unique_ptr<Mesh> mesh_;
     std::vector<LocalInjectionArbiter> injection_arbiters_;
+    // cir-h0-anchored only: one uplink per H0 and one uplink arbiter per H1.
+    std::vector<H0Uplink> uplinks_;
+    std::vector<UplinkInjectionArbiter> uplink_arbiters_;
     std::map<std::tuple<std::string, int, std::string>, NocAccumulator> noc_resources_;
     std::map<int, long> hop_histogram_;
 };

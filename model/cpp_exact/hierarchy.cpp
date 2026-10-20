@@ -36,9 +36,11 @@ PartialOutput Engine::partial() const {
     return PartialOutput{true, block, partial_beat == PARTIAL_BEATS - 1};
 }
 
-HierarchyNode::HierarchyNode(int state_entry_count_, int mvm_count) : state_entry_count(state_entry_count_) {
+HierarchyNode::HierarchyNode(int state_entry_count_, int mvm_count, bool directed)
+    : state_entry_count(state_entry_count_) {
     if (state_entry_count <= 0 || mvm_count <= 0) throw std::runtime_error("state and engine counts must be positive");
     engines.resize(mvm_count);
+    for (auto& engine : engines) engine.directed = directed;
     reset();
 }
 
@@ -97,7 +99,7 @@ Engine::OutputState HierarchyNode::output_next(const Engine& engine, bool accept
     if (engine.output_state == Engine::OUTPUT_IDLE)
         return (engine.result_valid[0] || engine.result_valid[1]) ? Engine::SEND_A : Engine::OUTPUT_IDLE;
     if (engine.output_state == Engine::SEND_A && accepted && engine.partial_beat == PARTIAL_BEATS - 1)
-        return Engine::SEND_B;
+        return engine.directed ? Engine::OUTPUT_IDLE : Engine::SEND_B;
     if (engine.output_state == Engine::SEND_B && accepted && engine.partial_beat == PARTIAL_BEATS - 1)
         return Engine::OUTPUT_IDLE;
     return engine.output_state;
@@ -195,7 +197,9 @@ void HierarchyNode::tick(const HierarchyOutputs& before, bool iter_start, bool s
             const auto& command = engine.slot_commands[selected_j];
             if (!command) throw std::runtime_error("valid J slot has no command metadata");
             engine.result_blocks[selected_result] = {command->block_a, command->block_b};
-            engine.state_a_valid = engine.state_b_valid = false;
+            // A directed job reads only the source (operand B) states.
+            engine.state_a_valid = engine.directed;
+            engine.state_b_valid = false;
             engine.state_a_pending = engine.state_b_pending = false;
         }
         if (old_state == Engine::COMPUTE && old_done) {
@@ -210,7 +214,8 @@ void HierarchyNode::tick(const HierarchyOutputs& before, bool iter_start, bool s
         } else {
             engine.partial_beat = 0;
         }
-        if (old_output_state == Engine::SEND_B && accepted[index] && old_partial_beat == PARTIAL_BEATS - 1)
+        if (old_output_state == (engine.directed ? Engine::SEND_A : Engine::SEND_B) && accepted[index] &&
+            old_partial_beat == PARTIAL_BEATS - 1)
             engine.result_valid[old_result_read_slot] = false;
     }
 

@@ -82,3 +82,16 @@ class DenseAnalyticalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class AnchoredAccumulateEstimate(unittest.TestCase):
+    """Validation points from results/flat_stationary_baseline_20261015 (C++ model)."""
+
+    OBSERVED = {65536: 2526591, 131072: 5103624, 262144: 10374012}
+
+    def test_within_two_percent_of_cpp_model(self):
+        from azilla_cycle_model.dense_analytical import anchored_accumulate_model
+        for spins, observed in self.OBSERVED.items():
+            estimate = anchored_accumulate_model(spins)["iteration_estimate_cycles"]
+            self.assertLess(abs(estimate / observed - 1), 0.02, (spins, estimate, observed))
+            self.assertLess(estimate, observed, "the estimate omits only positive delays")

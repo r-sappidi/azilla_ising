@@ -79,6 +79,10 @@ struct Engine {
     bool state_a_pending = false;
     bool state_b_pending = false;
     SymmetricMVM mvm;
+    // Flat weight-stationary baseline: a directed job needs one operand
+    // (the source block states) and returns one partial (SEND_A only).
+    // Never set on the CIR/RTL-matched path; reset() preserves it.
+    bool directed = false;
 
     void reset();
     bool work_done() const;
@@ -97,7 +101,7 @@ class HierarchyNode {
 public:
     enum NodeState { RESET, IDLE, RUN, DONE };
 
-    HierarchyNode(int state_entry_count, int mvm_count);
+    HierarchyNode(int state_entry_count, int mvm_count, bool directed = false);
     void reset();
     HierarchyOutputs outputs() const;
     int engine_count() const { return int(engines.size()); }

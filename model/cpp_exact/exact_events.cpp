@@ -57,8 +57,12 @@ RamulatorEventPerformanceModel::RamulatorEventPerformanceModel(
     if (dataset.spin_count != geometry.spin_count())
         throw std::runtime_error("dataset has " + std::to_string(dataset.spin_count) + " spins; geometry has " +
                                  std::to_string(geometry.spin_count()));
-    if (config_.execution_mode != "cir" && config_.execution_mode != "cores-only")
-        throw std::runtime_error("the C++ port implements execution modes 'cir' and 'cores-only' only");
+    if (config_.execution_mode != "cir" && config_.execution_mode != "cores-only" &&
+        config_.execution_mode != "flat-stationary" && config_.execution_mode != "cir-h0-anchored")
+        throw std::runtime_error(
+            "the C++ port implements execution modes 'cir', 'cores-only', 'flat-stationary' and 'cir-h0-anchored' only");
+    const bool flat = config_.execution_mode == "flat-stationary";
+    const bool anchored = config_.execution_mode == "cir-h0-anchored";
     if (config_.execution_mode == "cores-only" && config_.endpoint_policy != "streaming" &&
         config_.endpoint_policy != "buffered-v3")
         throw std::runtime_error("cores-only endpoint policy must be 'streaming' or 'buffered-v3'");
@@ -68,14 +72,15 @@ RamulatorEventPerformanceModel::RamulatorEventPerformanceModel(
     const int total_h0 = index_.total_h0();
     const int system_count = total_h0 + 2 * geometry.node_count();
     backend_ = std::make_unique<RamulatorBackend>(ramulator_library, ramulator_config, dataset_path, system_count,
-                                                  geometry.total_blocks(), /*timing_only=*/true);
+                                                  geometry.total_blocks(), /*timing_only=*/true, config_.dram_threads);
     frontends_.resize(index_.count());
     local_nodes_.resize(index_.count());
     auto make_frontend = [&](int system_id, int engines) {
         Frontend frontend;
         frontend.system_id = system_id;
         frontend.streamer =
-            std::make_unique<DramWeightStreamer>(engines, geometry.total_blocks(), mem_lanes_, mem_lanes_);
+            std::make_unique<DramWeightStreamer>(engines, geometry.total_blocks(), mem_lanes_, mem_lanes_,
+                                                 config_.max_outstanding);
         frontend.request_ready.assign(mem_lanes_, false);
         frontend.responses.assign(mem_lanes_, std::nullopt);
         return frontend;
@@ -85,16 +90,28 @@ RamulatorEventPerformanceModel::RamulatorEventPerformanceModel(
         int h0 = global_h0 % geometry.h0_per_h1;
         int t = index_.h0(global_h0);
         frontends_[t] = make_frontend(global_h0, config_.h0_mvm_count);
-        local_nodes_[t] = std::make_unique<HierarchyNode>(geometry.cores_per_h0, config_.h0_mvm_count);
-        h0_adapters_.push_back(std::make_unique<H0Adapter>(
-            geometry.cores_per_h0, config_.h0_mvm_count, node * geometry.blocks_per_h1() + h0 * geometry.cores_per_h0));
+        // Flat baseline: the H0 state table holds every block it consumes
+        // (global index) and its engines run directed jobs.
+        // (Anchored: global index too, symmetric engines, plus one uplink.)
+        const int first_block = node * geometry.blocks_per_h1() + h0 * geometry.cores_per_h0;
+        local_nodes_[t] = std::make_unique<HierarchyNode>(
+            (flat || anchored) ? geometry.total_blocks() : geometry.cores_per_h0, config_.h0_mvm_count, flat);
+        h0_adapters_.push_back(std::make_unique<H0Adapter>(geometry.cores_per_h0, config_.h0_mvm_count, first_block));
+        if (anchored)
+            uplinks_.emplace_back(first_block, geometry.cores_per_h0, geometry.blocks_per_h1(), geometry.mesh_x, node,
+                                  config_.h0_mvm_count, config_.anchored_uplink_packets, config_.anchored_accumulate,
+                                  geometry.total_blocks());
     }
     for (int node = 0; node < geometry.node_count(); ++node) {
         int h1_t = index_.h1(node), cross_t = index_.cross(node);
         frontends_[h1_t] = make_frontend(total_h0 + node, config_.h1_mvm_count);
         local_nodes_[h1_t] = std::make_unique<HierarchyNode>(geometry.blocks_per_h1(), config_.h1_mvm_count);
-        h1_adapters_.push_back(std::make_unique<H1ChildAdapter>(geometry.h0_per_h1, geometry.cores_per_h0,
-                                                                config_.h1_mvm_count, node * geometry.blocks_per_h1()));
+        // Anchored: the H1 child crossbar also switches the h0_per_h1 uplinks
+        // (sources h1_mvm_count .. h1_mvm_count + h0_per_h1 - 1).
+        h1_adapters_.push_back(std::make_unique<H1ChildAdapter>(
+            geometry.h0_per_h1, geometry.cores_per_h0, config_.h1_mvm_count + (anchored ? geometry.h0_per_h1 : 0),
+            node * geometry.blocks_per_h1(), /*parent_first=*/anchored));
+        if (anchored) uplink_arbiters_.emplace_back(geometry.h0_per_h1);
         cross_nodes_.push_back(std::make_unique<CrossH1Node>(geometry.total_blocks(), config_.cross_mvm_count,
                                                              geometry.blocks_per_h1(), geometry.mesh_x, node));
         frontends_[cross_t] = make_frontend(total_h0 + geometry.node_count() + node, config_.cross_mvm_count);
@@ -106,6 +123,8 @@ RamulatorEventPerformanceModel::RamulatorEventPerformanceModel(
 void RamulatorEventPerformanceModel::reset_timing_state() {
     mesh_->reset();
     for (auto& arbiter : injection_arbiters_) arbiter.reset();
+    for (auto& uplink : uplinks_) uplink.reset();
+    for (auto& arbiter : uplink_arbiters_) arbiter.reset();
     for (auto& adapter : h0_adapters_) adapter->reset();
     for (auto& adapter : h1_adapters_) adapter->reset();
     for (auto& frontend : frontends_) {
@@ -329,14 +348,19 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
     }
     const long initialization = 3 + long(geometry_.total_blocks()) * 33;
     if (config_.execution_mode == "cores-only") return run_cores_only(schedule_records, initialization);
-    CompiledSchedule compiled = compile_schedule(geometry_, schedule_records);
+    const bool flat = config_.execution_mode == "flat-stationary";
+    const bool anchored = config_.execution_mode == "cir-h0-anchored";
+    CompiledSchedule compiled = flat       ? compile_flat_schedule(geometry_, schedule_records)
+                                : anchored ? compile_anchored_schedule(geometry_, schedule_records, config_.h0_mvm_count)
+                                           : compile_schedule(geometry_, schedule_records);
     const int chiplet_latency = config_.chiplet_link_latency_cycles;
     const int node_count = geometry_.node_count();
     const int total_h0 = index_.total_h0();
     const int target_count = index_.count();
 
     // ---------------------------------------------------------- publication
-    std::vector<BlockPair> publication_pairs = compiled.publications();
+    std::vector<BlockPair> publication_pairs =
+        compiled.has_explicit_publications ? compiled.explicit_publications : compiled.publications();
     std::vector<PacketRelease> publications;
     for (size_t index = 0; index < publication_pairs.size(); ++index) {
         const auto& [block, owner] = publication_pairs[index];
@@ -372,12 +396,25 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
 
     for (auto& cross : cross_nodes_) cross->node.node_state = HierarchyNode::RUN;
 
+    // Flat baseline: an H0 state table is filled with one write per distinct
+    // source block it consumes (local and published), like the H1 table fill.
+    std::vector<long> flat_h0_sources(total_h0, 0);
+    if (flat || anchored)
+        for (int global_h0 = 0; global_h0 < total_h0; ++global_h0) {
+            std::set<int> sources;
+            for (const auto& work : compiled.h0[global_h0]) {
+                sources.insert(work.block_b);
+                if (anchored) sources.insert(work.block_a);
+            }
+            flat_h0_sources[global_h0] = long(sources.size());
+        }
     std::vector<long> local_start_pulse(target_count, -1);  // -1: none
     for (int t = 0; t < target_count; ++t) {
         if (!local_nodes_[t]) continue;
         WorkTarget target = index_.target(t);
-        long ready_global = target.level == Level::H0 ? geometry_.cores_per_h0 + 2
-                                                      : geometry_.blocks_per_h1() + 2 + chiplet_latency;
+        long ready_global = target.level == Level::H0
+                                ? ((flat || anchored) ? flat_h0_sources[t] : long(geometry_.cores_per_h0)) + 2
+                                : geometry_.blocks_per_h1() + 2 + chiplet_latency;
         long ready_local = ready_global - compute_start;
         if (ready_local <= 0) {
             local_nodes_[t]->node_state = HierarchyNode::RUN;
@@ -395,6 +432,7 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
     int done_pending_count = 0;
     std::vector<long> done_received(node_count, -1);
     std::vector<long> local_done(target_count, -1);
+    std::vector<long> flush_end(total_h0, -1);
     int local_done_count = 0;
     const int local_node_count = total_h0 + node_count;
     std::vector<long> cross_done(node_count, -1);
@@ -414,6 +452,10 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
     std::vector<std::optional<Flit>> h1_packets(node_count);
     std::vector<std::optional<Flit>> injections(node_count);
     std::vector<InjectionOutputs> arbiter_outputs(node_count);
+    std::vector<UplinkOutputs> uplink_outputs(anchored ? total_h0 : 0);
+    std::vector<UplinkInjectionOutputs> uplink_arbiter_outputs(anchored ? node_count : 0);
+    std::vector<std::optional<Flit>> remote_tx(geometry_.h0_per_h1);
+    std::vector<PartialOutput> h1_sources;
     std::vector<std::vector<bool>> ready(target_count);
     std::vector<std::vector<std::optional<DmaCommand>>> empty_commands(target_count);
     for (int t = 0; t < target_count; ++t) {
@@ -438,6 +480,16 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
             bool all_done = true;
             for (int node = 0; node < node_count; ++node)
                 if (!cross_outputs[node].iter_done) { all_done = false; break; }
+            // Anchored: the H0 nodes are the mesh partial sources, so the
+            // quiet window may only open once every one of them is done and
+            // every uplink has drained (flushed in accumulate mode, FIFOs
+            // empty otherwise; a queued sibling-bound packet is not NoC
+            // activity and would otherwise be delivered after EPOCH_DONE).
+            // October 15 fix: FIFO mode previously ignored the uplink FIFOs.
+            if (anchored)
+                for (int global_h0 = 0; global_h0 < total_h0 && all_done; ++global_h0)
+                    if (!node_outputs[index_.h0(global_h0)].iter_done || !uplinks_[global_h0].drained())
+                        all_done = false;
             if (all_done) {
                 phase = CROSS_QUIET;
                 quiet = 0;
@@ -459,7 +511,22 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
             const auto& rx = comb[node].output_flits[LOCAL];
             bool rx_partial = rx.has_value() && rx->packet_type == NOC_PARTIAL;
             parents[node] = RoutedPartial{rx_partial, rx ? rx->block_id : 0};
-            h1_adapter_outputs[node] = h1_adapters_[node]->outputs(node_outputs[index_.h1(node)].partials, parents[node]);
+            if (anchored) {
+                // Uplink selection per H0, then the H1 crossbar sees H1 engines
+                // followed by the sibling-bound uplink partials.
+                h1_sources = node_outputs[index_.h1(node)].partials;
+                for (int h0 = 0; h0 < geometry_.h0_per_h1; ++h0) {
+                    int global_h0 = node * geometry_.h0_per_h1 + h0;
+                    uplink_outputs[global_h0] = uplinks_[global_h0].outputs(node_outputs[index_.h0(global_h0)].partials);
+                    const UplinkOutputs& u = uplink_outputs[global_h0];
+                    h1_sources.push_back(u.head_valid && u.same_h1 ? u.partial : PartialOutput{});
+                    remote_tx[h0] = u.head_valid && !u.same_h1 ? u.tx : std::nullopt;
+                }
+                h1_adapter_outputs[node] = h1_adapters_[node]->outputs(h1_sources, parents[node]);
+                uplink_arbiter_outputs[node] = uplink_arbiters_[node].outputs(remote_tx);
+            } else {
+                h1_adapter_outputs[node] = h1_adapters_[node]->outputs(node_outputs[index_.h1(node)].partials, parents[node]);
+            }
             local_ready[node] = rx_partial ? h1_adapter_outputs[node].parent_ready : true;
         }
         for (int global_h0 = 0; global_h0 < total_h0; ++global_h0)
@@ -480,8 +547,11 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
 
         bool any_injection = false;
         for (int node = 0; node < node_count; ++node) {
-            arbiter_outputs[node] =
-                injection_arbiters_[node].outputs(cross_outputs[node].tx, h1_packets[node], comb[node].input_ready[LOCAL]);
+            if (anchored && cross_outputs[node].tx.has_value())
+                throw std::runtime_error("cross node produced a partial in cir-h0-anchored mode");
+            arbiter_outputs[node] = injection_arbiters_[node].outputs(
+                anchored ? uplink_arbiter_outputs[node].tx : cross_outputs[node].tx, h1_packets[node],
+                comb[node].input_ready[LOCAL]);
             injections[node] = arbiter_outputs[node].selected;
             if (injections[node]) any_injection = true;
         }
@@ -510,9 +580,17 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
             if (!local_nodes_[t]) continue;
             WorkTarget target = index_.target(t);
             const StreamerOutputs& stream = stream_outputs[t];
-            const std::vector<bool>& partial_ready = target.level == Level::H0
-                                                         ? h0_adapter_outputs[t].engine_ready
-                                                         : h1_adapter_outputs[target.node].node_ready;
+            std::vector<bool> partial_ready = target.level == Level::H0
+                                                  ? h0_adapter_outputs[t].engine_ready
+                                                  : h1_adapter_outputs[target.node].node_ready;
+            if (anchored) {
+                if (target.level == Level::H0) {
+                    const UplinkOutputs& u = uplink_outputs[t];
+                    if (u.selected_engine >= 0 && u.input_ready) partial_ready[u.selected_engine] = true;
+                } else {
+                    partial_ready.resize(config_.h1_mvm_count);  // crossbar sources beyond the H1 engines are uplinks
+                }
+            }
             std::vector<std::optional<DmaCommand>> commands(stream.node.size());
             std::vector<bool> weight_valid(stream.node.size());
             for (size_t e = 0; e < stream.node.size(); ++e) {
@@ -538,8 +616,50 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
         // Adapters use pre-edge partials.
         for (int global_h0 = 0; global_h0 < total_h0; ++global_h0)
             h0_adapters_[global_h0]->tick(h0_adapter_outputs[global_h0], node_outputs[index_.h0(global_h0)].partials);
-        for (int node = 0; node < node_count; ++node)
-            h1_adapters_[node]->tick(h1_adapter_outputs[node], node_outputs[index_.h1(node)].partials, parents[node]);
+        for (int node = 0; node < node_count; ++node) {
+            if (!anchored) {
+                h1_adapters_[node]->tick(h1_adapter_outputs[node], node_outputs[index_.h1(node)].partials, parents[node]);
+                continue;
+            }
+            h1_sources = node_outputs[index_.h1(node)].partials;
+            for (int h0 = 0; h0 < geometry_.h0_per_h1; ++h0) {
+                const UplinkOutputs& u = uplink_outputs[node * geometry_.h0_per_h1 + h0];
+                h1_sources.push_back(u.head_valid && u.same_h1 ? u.partial : PartialOutput{});
+            }
+            h1_adapters_[node]->tick(h1_adapter_outputs[node], h1_sources, parents[node]);
+            for (int h0 = 0; h0 < geometry_.h0_per_h1; ++h0) {
+                int global_h0 = node * geometry_.h0_per_h1 + h0;
+                const UplinkOutputs& u = uplink_outputs[global_h0];
+                const HierarchyOutputs& ho = node_outputs[index_.h0(global_h0)];
+                bool accepted = u.head_valid &&
+                                (u.same_h1 ? h1_adapter_outputs[node].node_ready[config_.h1_mvm_count + h0]
+                                           : (uplink_arbiter_outputs[node].selected_h0 == h0 &&
+                                              arbiter_outputs[node].cross_ready));
+                uplinks_[global_h0].tick(u, ho.partials, accepted);
+                const auto& engines = local_nodes_[index_.h0(global_h0)]->engines;
+                if (u.head_valid) {
+                    if (u.same_h1) { counters.uplink_sibling_beats += accepted; counters.uplink_sibling_stalls += !accepted; }
+                    else { counters.uplink_mesh_beats += accepted; counters.uplink_mesh_stalls += !accepted; }
+                }
+                for (size_t e = 0; e < ho.partials.size(); ++e) {
+                    bool acc = h0_adapter_outputs[global_h0].engine_ready[e] ||
+                               (int(e) == u.selected_engine && u.input_ready);
+                    if (ho.partials[e].valid && !acc) {
+                        counters.engine_output_stalls += 1;
+                        int b = ho.partials[e].block_id;
+                        bool local = uplinks_[global_h0].first_block <= b &&
+                                     b < uplinks_[global_h0].first_block + uplinks_[global_h0].block_count;
+                        if (local) counters.engine_local_output_stalls += 1;
+                        else if (int(e) != u.selected_engine) counters.engine_uplink_wait_stalls += 1;
+                        else counters.engine_uplink_full_stalls += 1;
+                    }
+                    if ((engines[e].result_valid[0] || engines[e].result_reserved[0]) &&
+                        (engines[e].result_valid[1] || engines[e].result_reserved[1]))
+                        counters.engine_result_full_cycles += 1;
+                }
+            }
+            uplink_arbiters_[node].tick(uplink_arbiter_outputs[node], arbiter_outputs[node].cross_ready);
+        }
 
         mesh_->tick(injections, local_ready, comb);
         for (int node = 0; node < node_count; ++node)
@@ -563,8 +683,16 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
             if (local_done[t] < 0 && local_nodes_[t]->node_state == HierarchyNode::DONE) {
                 local_done[t] = cycle + 1;
                 ++local_done_count;
+                if (anchored && config_.anchored_accumulate && t < total_h0) uplinks_[t].start_flush();
             }
         }
+        if (anchored && config_.anchored_accumulate)
+            for (int global_h0 = 0; global_h0 < total_h0; ++global_h0)
+                if (flush_end[global_h0] < 0 && uplinks_[global_h0].flush_started() && uplinks_[global_h0].flushed()) {
+                    flush_end[global_h0] = cycle + 1;
+                    counters.flush_packets += uplinks_[global_h0].touched_remote_blocks();
+                    counters.flush_cycles_max = std::max(counters.flush_cycles_max, flush_end[global_h0] - local_done[global_h0]);
+                }
         for (int node = 0; node < node_count; ++node)
             if (cross_done[node] < 0 && cross_nodes_[node]->node.node_state == HierarchyNode::DONE)
                 cross_done[node] = cycle + 1;
@@ -662,7 +790,8 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
                      (idle_tick_modulus_ <= 0 || idle_tick_modulus_ == 7600) &&
                      ramulator_config_sha256_ == CERTIFIED_RAMULATOR_CONFIG_SHA256;
     std::string accuracy;
-    if (certified) accuracy = "rtl-differential";
+    if (flat || anchored) accuracy = "cycle-structured-unverified";  // no RTL implements these modes
+    else if (certified) accuracy = "rtl-differential";
     else if (chiplet_latency != 0 || !config_.interconnect.is_rtl_direct()) accuracy = "parameterized-interconnect-projection";
     else accuracy = "cycle-structured-unverified";
 
@@ -683,10 +812,11 @@ ExactEventResult RamulatorEventPerformanceModel::run(const std::vector<Scheduled
     result.dram = dram;
     result.chiplet_link_latency_cycles = chiplet_latency;
     result.interconnect = config_.interconnect;
-    result.execution_mode = "cir";
+    result.execution_mode = config_.execution_mode;
     long total_jobs = result.scheduled_h0 + result.scheduled_h1 + result.scheduled_cross;
-    result.unordered_interaction_blocks = total_jobs;
-    result.directed_core_jobs = 0;
+    // Flat: two directed jobs, reads and stored copies per unordered block.
+    result.unordered_interaction_blocks = flat ? total_jobs / 2 : total_jobs;
+    result.directed_core_jobs = flat ? total_jobs : 0;
     result.weight_block_reads = total_jobs;
     result.logical_weight_blocks_stored = total_jobs;
     result.remote_state_packets = long(publication_pairs.size());

@@ -47,6 +47,13 @@ struct CompiledSchedule {
     std::vector<std::deque<WorkItem>> h1;
     std::vector<std::deque<WorkItem>> cross;
     std::map<BlockPair, int> owners;
+    // H0-resident schedules (compile_flat_schedule, compile_anchored_schedule):
+    // h1/cross are empty, H0 state tables are indexed by global block
+    // (global_h0_state) and the state publications are listed explicitly
+    // as (block, consuming H1) pairs whose H1s differ.
+    bool global_h0_state = false;
+    bool has_explicit_publications = false;
+    std::vector<BlockPair> explicit_publications;
 
     long count_h0() const;
     long count_h1() const;
@@ -58,6 +65,21 @@ struct CompiledSchedule {
 int mesh_distance(const Geometry& geometry, int node_a, int node_b);
 std::map<BlockPair, int> allocate_h1_pairs(const Geometry& geometry);
 CompiledSchedule compile_schedule(const Geometry& geometry, const std::vector<ScheduledBlock>& pairs);
+// Flat weight-stationary baseline: every unordered block becomes
+// WorkItem(destination, source) on both endpoint H0s (the row representation
+// is stored at the destination H0; the transposed copy at the other), no
+// hierarchy ownership, state publications as in compile_cores_only_schedule.
+CompiledSchedule compile_flat_schedule(const Geometry& geometry, const std::vector<ScheduledBlock>& pairs);
+// H0-anchored symmetric ownership: a block inside one H0 stays there; every
+// other block is owned by the endpoint H0 with fewer jobs so far, counting
+// the forced within-H0 blocks first (ties to the lower endpoint), evaluated
+// symmetrically once.  Publications are the
+// (endpoint block, owner H1) pairs whose H1s differ.
+// ``h0_engines``: engines per H0 (8 cycles per job at 4 engines) against the
+// 4-cycle mesh injection cost of a cross-H1 partial at the owner's H1 port;
+// the owner is the endpoint that minimizes the larger of the two loads.
+CompiledSchedule compile_anchored_schedule(const Geometry& geometry, const std::vector<ScheduledBlock>& pairs,
+                                           int h0_engines);
 
 // Port of scheduler.compile_cores_only_schedule (destination-stationary
 // expansion): every unordered block becomes WorkItem(destination, source) on
@@ -74,7 +96,9 @@ struct CoresOnlySchedule {
     }
 };
 CoresOnlySchedule compile_cores_only_schedule(const Geometry& geometry, const std::vector<ScheduledBlock>& pairs);
-DmaCommand command_for(const WorkTarget& target, const WorkItem& work, const Geometry& geometry);
+// ``global_h0_state``: H0 state tables hold every block (flat baseline).
+DmaCommand command_for(const WorkTarget& target, const WorkItem& work, const Geometry& geometry,
+                       bool global_h0_state = false);
 
 // Target/port indexing shared by the exact-event model.  Targets are
 // numbered like Ramulator system ids: H0 global index, then H1 per node,
@@ -117,6 +141,7 @@ private:
     long total_ = 0;
     long retired_ = 0;
     long pending_count_ = 0;
+    bool global_h0_state_ = false;
 };
 
 }  // namespace azilla

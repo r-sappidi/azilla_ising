@@ -52,9 +52,10 @@ void H0Adapter::tick(const H0AdapterOutputs& before, const std::vector<PartialOu
     }
 }
 
-H1ChildAdapter::H1ChildAdapter(int child_count_, int blocks_per_child_, int mvm_count_, int base_block_id_)
+H1ChildAdapter::H1ChildAdapter(int child_count_, int blocks_per_child_, int mvm_count_, int base_block_id_,
+                               bool parent_first_)
     : child_count(child_count_), blocks_per_child(blocks_per_child_), mvm_count(mvm_count_),
-      base_block_id(base_block_id_), locked_source(child_count_, -1) {}
+      base_block_id(base_block_id_), parent_first(parent_first_), locked_source(child_count_, -1) {}
 
 void H1ChildAdapter::reset() {
     std::fill(locked_source.begin(), locked_source.end(), -1);
@@ -68,6 +69,7 @@ bool H1ChildAdapter::belongs(int child, int block) const {
 
 int H1ChildAdapter::select(int child, const std::vector<PartialOutput>& partials, const RoutedPartial& parent) const {
     if (locked_source[child] >= 0) return locked_source[child];
+    if (parent_first && parent.valid && belongs(child, parent.block_id)) return mvm_count;
     for (int engine = 0; engine < int(partials.size()); ++engine)
         if (partials[engine].valid && belongs(child, partials[engine].block_id)) return engine;
     if (parent.valid && belongs(child, parent.block_id)) return mvm_count;

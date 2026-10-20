@@ -376,6 +376,16 @@ most 64 outstanding reads. The generated `tb/ramulator_128x32.yaml` is a timing
 projection derived from Ramulator's GDDR6 model; it is useful for architectural
 comparison but is not a vendor-qualified 32-Gb/s GDDR timing specification.
 
+`tb/ramulator_hbm4_config.py` exports a co-packaged HBM4 alternative
+(`tb/ramulator_hbm4_512x8.yaml`: Ramulator2 `HBM4`, 8 x 64-bit channels per
+H0 at 8 Gb/s, same 512 GB/s peak, same 250 ps tick) and, with
+`AZILLA_ADDR_MAPPER=MOP4CLXOR`, the `*_mop4.yaml` variants
+(`tb/ramulator_128x32_mop4.yaml`, `tb/ramulator_hbm4_512x8_mop4.yaml`) whose
+bank interleave lets a sequential 32-byte stream approach channel peak at
+4 ticks per cycle. These are consumed by the C++ exact-event model
+(`--ramulator-config`); the RTL testbenches still hardcode
+`tb/ramulator_128x32.yaml` and 64 outstanding reads.
+
 ## Ramulator performance sweep
 
 Compare MVM counts and independent 256-bit result-injection lanes without

@@ -181,6 +181,31 @@ against completed 64K fixed-H1 and 128K+ multi-H1 runs, including memory
 and link saturation. Existing simulation campaigns were left untouched.
 The formula alone cannot establish a large-size CIR-versus-core speedup.
 
+## Anchored + accumulate estimate (October 15)
+
+`anchored_accumulate_model(spins, geometry=None, h0_engines=4)` estimates the
+dense iteration of execution mode `cir-h0-anchored` with
+`--anchored-accumulate 1` (docs/cpp_exact_model.md). Because that design has
+no per-block mesh traffic, the iteration is additive: publication phase at the
+CIR cadence, H0 state-table fill, saturated symmetric-engine service on the
+balanced per-H0 job count (38 cycles per job, one in eight same-bank), the
+accumulator flush at its resource bound (uplink, per-H1 mesh port, crossbar
+child port) and the barrier. No fitted terms. Against the C++ model
+(results/flat_stationary_baseline_20261015):
+
+| Geometry | Spins | Estimate | Observed | Error |
+|---|---:|---:|---:|---:|
+| 1x1 | 65,536 | 2,506,578 | 2,526,591 | -0.79% |
+| 2x1 | 131,072 | 5,073,746 | 5,103,624 | -0.59% |
+| 2x2 | 262,144 | 10,246,994 | 10,374,012 | -1.22% |
+
+Projections: 512K (2x4) 20.7M, 1M (4x4) 42.0M cycles, to be checked against
+the 512K C++ point when it completes. The flush term is 1-3% of the iteration
+and the only mesh-dependent one (observed/bound 1.4 at 2x2). The CIR estimate
+above remains -0.96% at 128K and -18.3% at 256K (mesh backpressure on the
+per-block partial traffic, which the accumulate design removes); it is not
+patched. `model/tests/test_dense_analytical.py` checks the three points.
+
 ## Reproduce
 
 Run from the repository root, with completed local v3 reference artifacts:
